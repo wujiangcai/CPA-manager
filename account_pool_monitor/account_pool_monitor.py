@@ -540,6 +540,33 @@ def quota_cache_is_fresh(cache: dict[str, Any] | None, cfg: dict[str, Any]) -> b
     return (now_local() - created_at).total_seconds() <= max_age
 
 
+def quota_cache_covers_accounts(cache: dict[str, Any] | None, accounts: list[dict[str, Any]]) -> bool:
+    if not isinstance(cache, dict) or not isinstance(cache.get("reports"), list):
+        return False
+    codex_accounts = [item for item in accounts if clean_string(item.get("type")).lower() == "codex"]
+    if not codex_accounts:
+        return True
+    merged_accounts = []
+    for account in codex_accounts:
+        item = dict(account)
+        item["issues"] = list(account.get("issues") or [])
+        merged_accounts.append(item)
+    merge_quota(merged_accounts, cache)
+    matched = sum(1 for item in merged_accounts if isinstance(item.get("quota"), dict))
+    if matched < len(codex_accounts):
+        log_event(
+            "warn",
+            "额度缓存未覆盖当前号池",
+            {"accounts": len(codex_accounts), "matched": matched, "reports": len(cache.get("reports") or [])},
+        )
+        return False
+    return True
+
+
+def quota_cache_is_usable(cache: dict[str, Any] | None, cfg: dict[str, Any], accounts: list[dict[str, Any]]) -> bool:
+    return quota_cache_is_fresh(cache, cfg) and quota_cache_covers_accounts(cache, accounts)
+
+
 def quota_error_is_invalid(error: Any) -> bool:
     text = clean_string(error).lower()
     return any(
@@ -1648,10 +1675,11 @@ def public_config(cfg: dict[str, Any]) -> dict[str, Any]:
 def build_status_payload() -> dict[str, Any]:
     cfg = load_config()
     cache = load_quota_cache()
-    cleanup_result = cleanup_auth_pool(cfg, quota_cache=cache if quota_cache_is_fresh(cache, cfg) else None)
+    accounts, warnings = scan_auth_accounts(cfg)
+    quota_cache = cache if quota_cache_is_usable(cache, cfg, accounts) else None
+    cleanup_result = cleanup_auth_pool(cfg, quota_cache=quota_cache)
     cleanup_recent = read_recent_cleanup_items(CLEANUP_DISPLAY_HOURS)
     cleanup_count_stats = cleanup_stats(CLEANUP_DISPLAY_HOURS)
-    accounts, warnings = scan_auth_accounts(cfg)
     cache = load_quota_cache()
     accounts = merge_quota(accounts, cache)
     public_accounts = sanitize_for_output(accounts)
@@ -2568,26 +2596,36 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-        with QUOTA_LOCK:
-            cfg = load_config()
-            try:
+    def handle_quota(self) -> None:
+        cfg = load_config()
+        try:
+            with QUOTA_LOCK:
                 cache = query_quota_reports(cfg)
                 cleanup_result = cleanup_auth_pool(cfg, force=True, quota_cache=cache)
-            except Exception as exc:
-                log_event("error", "CPA 额度查询失败", {"error": str(exc)})
-                payload = build_status_payload()
-                payload["ok"] = False
-                payload["quota_error"] = str(exc)
-                self.send_json(payload, 200)
-                return
+        except Exception as exc:
+            log_event("error", "CPA 额度查询失败", {"error": str(exc)})
             payload = build_status_payload()
-            payload["cleanup"] = sanitize_for_output(cleanup_result)
-            self.send_json(payload)
+            payload["ok"] = False
+            payload["quota_error"] = str(exc)
+            self.send_json(payload, 200)
+            return
+        payload = build_status_payload()
+        payload["quota"] = sanitize_for_output(cache)
+        payload["cleanup"] = sanitize_for_output(cleanup_result)
+        self.send_json(payload)
 
     def handle_cleanup(self) -> None:
         cfg = load_config()
+        accounts, _warnings = scan_auth_accounts(cfg)
         cache = load_quota_cache()
-        quota_cache = cache if quota_cache_is_fresh(cache, cfg) else None
+        quota_cache = cache if quota_cache_is_usable(cache, cfg, accounts) else None
+        if quota_cache is None:
+            try:
+                with QUOTA_LOCK:
+                    quota_cache = query_quota_reports(cfg)
+            except Exception as exc:
+                log_event("error", "手动清理前刷新额度失败，已跳过额度删除", {"error": str(exc)})
+                quota_cache = None
         try:
             result = cleanup_auth_pool(cfg, force=True, quota_cache=quota_cache)
         except Exception as exc:
