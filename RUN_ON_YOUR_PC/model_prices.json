@@ -1,0 +1,68 @@
+{
+  "currency": "USD",
+  "currency_symbol": "$",
+  "updated": "2026-06-08",
+  "source": "https://platform.openai.com/docs/pricing/",
+  "note": "OpenAI official API pricing copied from https://platform.openai.com/docs/pricing/ on 2026-06-08. Prices are editable. Default is 0 to avoid guessing unknown CPA model prices.",
+  "default": {
+    "input_per_1m": 0,
+    "cached_input_per_1m": 0,
+    "output_per_1m": 0,
+    "total_blended_per_1m": 6.0
+  },
+  "models": {
+    "历史导入": {
+      "input_per_1m": 0,
+      "cached_input_per_1m": 0,
+      "output_per_1m": 0,
+      "total_blended_per_1m": 6.0
+    },
+    "gpt-5.5": {
+      "input_per_1m": 5.0,
+      "cached_input_per_1m": 0.5,
+      "output_per_1m": 30.0,
+      "long_context_min_input_tokens": 272000,
+      "long_input_per_1m": 10.0,
+      "long_cached_input_per_1m": 1.0,
+      "long_output_per_1m": 45.0
+    },
+    "gpt-5.5-pro": {
+      "input_per_1m": 30.0,
+      "cached_input_per_1m": 0.0,
+      "output_per_1m": 180.0,
+      "long_context_min_input_tokens": 272000,
+      "long_input_per_1m": 60.0,
+      "long_cached_input_per_1m": 0.0,
+      "long_output_per_1m": 270.0
+    },
+    "gpt-5.4": {
+      "input_per_1m": 2.5,
+      "cached_input_per_1m": 0.25,
+      "output_per_1m": 15.0
+    },
+    "gpt-5.4-pro": {
+      "input_per_1m": 30.0,
+      "cached_input_per_1m": 0.0,
+      "output_per_1m": 180.0,
+      "long_context_min_input_tokens": 272000,
+      "long_input_per_1m": 60.0,
+      "long_cached_input_per_1m": 0.0,
+      "long_output_per_1m": 270.0
+    },
+    "gpt-5.4-mini": {
+      "input_per_1m": 0.75,
+      "cached_input_per_1m": 0.075,
+      "output_per_1m": 4.5
+    },
+    "gpt-5.4-nano": {
+      "input_per_1m": 0.2,
+      "cached_input_per_1m": 0.02,
+      "output_per_1m": 1.25
+    },
+    "gpt-5.3-codex": {
+      "input_per_1m": 1.75,
+      "cached_input_per_1m": 0.175,
+      "output_per_1m": 14.0
+    }
+  }
+}

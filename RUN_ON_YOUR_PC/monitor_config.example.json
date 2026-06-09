@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 18319,
+  "upstream_base_url": "http://127.0.0.1:8317/v1",
+  "upstream_api_key": "",
+  "upstream_api_key_env": "CPA_MONITOR_UPSTREAM_API_KEY",
+  "preserve_client_authorization": true,
+  "data_dir": "monitor_data",
+  "price_file": "model_prices.json",
+  "connect_timeout_seconds": 15,
+  "read_timeout_seconds": 900,
+  "max_body_bytes": 104857600
+}
