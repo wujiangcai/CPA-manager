@@ -26,10 +26,12 @@ APP_NAME = "zny CPA Account Pool Monitor"
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "monitor_data"
 EXPORT_DIR = DATA_DIR / "available_exports"
+IMPORT_DIR = DATA_DIR / "import_batches"
 CONFIG_PATH = APP_DIR / "monitor_config.json"
 QUOTA_CACHE_PATH = DATA_DIR / "quota_cache.json"
 EVENT_LOG_PATH = DATA_DIR / "events.jsonl"
 CLEANUP_MANIFEST_PATH = DATA_DIR / "cleanup_manifest.jsonl"
+LAST_IMPORT_PATH = DATA_DIR / "last_import_result.json"
 CLEANUP_DISPLAY_HOURS = 12
 
 DEFAULT_CONFIG = {
@@ -43,9 +45,12 @@ DEFAULT_CONFIG = {
     "proxy_url": "",
     "quota_low_threshold_percent": 5,
     "quota_query_timeout_seconds": 25,
-    "quota_query_concurrency": 8,
+    "quota_query_concurrency": 32,
     "quota_query_retries": 3,
     "quota_delete_cache_max_age_seconds": 600,
+    "proxy_check_enabled": True,
+    "proxy_check_url": "https://chatgpt.com/cdn-cgi/trace",
+    "proxy_check_timeout_seconds": 8,
     "auto_cleanup_enabled": False,
     "auto_cleanup_interval_seconds": 3600,
     "cleanup_delete_quota_low": False,
@@ -55,6 +60,10 @@ DEFAULT_CONFIG = {
     "cleanup_move_missing_tokens": True,
     "cleanup_move_read_errors": True,
     "cleanup_move_access_expired": False,
+    "import_keep_alive_in_auth_dir": True,
+    "import_move_dead_from_auth_dir": True,
+    "import_try_management_upload": True,
+    "import_upload_concurrency": 32,
 }
 
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -77,6 +86,7 @@ SENSITIVE_KEYS = {
 LOG_LOCK = threading.Lock()
 QUOTA_LOCK = threading.Lock()
 CLEANUP_LOCK = threading.Lock()
+IMPORT_LOCK = threading.Lock()
 CLEANUP_STATE = {"last_run": 0.0, "last_result": None}
 
 
@@ -223,9 +233,12 @@ def load_config() -> dict[str, Any]:
     cfg["port"] = int(cfg.get("port") or 18320)
     cfg["quota_low_threshold_percent"] = float(cfg.get("quota_low_threshold_percent") or 5)
     cfg["quota_query_timeout_seconds"] = int(cfg.get("quota_query_timeout_seconds") or 25)
-    cfg["quota_query_concurrency"] = max(1, min(int(cfg.get("quota_query_concurrency") or 8), 64))
+    cfg["quota_query_concurrency"] = max(1, min(int(cfg.get("quota_query_concurrency") or 32), 256))
     cfg["quota_query_retries"] = max(1, min(int(cfg.get("quota_query_retries") or 3), 6))
     cfg["quota_delete_cache_max_age_seconds"] = max(30, int(cfg.get("quota_delete_cache_max_age_seconds") or 600))
+    cfg["proxy_check_enabled"] = bool(cfg.get("proxy_check_enabled", True))
+    cfg["proxy_check_url"] = clean_string(cfg.get("proxy_check_url") or "https://chatgpt.com/cdn-cgi/trace")
+    cfg["proxy_check_timeout_seconds"] = max(2, min(int(cfg.get("proxy_check_timeout_seconds") or 8), 60))
     cfg["auto_cleanup_enabled"] = bool(cfg.get("auto_cleanup_enabled", True))
     cfg["auto_cleanup_interval_seconds"] = max(3600, int(cfg.get("auto_cleanup_interval_seconds") or 3600))
     cfg["cleanup_delete_quota_low"] = bool(cfg.get("cleanup_delete_quota_low", True))
@@ -235,6 +248,10 @@ def load_config() -> dict[str, Any]:
     cfg["cleanup_move_read_errors"] = bool(cfg.get("cleanup_move_read_errors", True))
     cfg["cleanup_move_access_expired"] = bool(cfg.get("cleanup_move_access_expired", False))
     cfg["cleanup_skip_disabled"] = bool(cfg.get("cleanup_skip_disabled", True))
+    cfg["import_keep_alive_in_auth_dir"] = bool(cfg.get("import_keep_alive_in_auth_dir", True))
+    cfg["import_move_dead_from_auth_dir"] = bool(cfg.get("import_move_dead_from_auth_dir", True))
+    cfg["import_try_management_upload"] = bool(cfg.get("import_try_management_upload", True))
+    cfg["import_upload_concurrency"] = max(1, min(int(cfg.get("import_upload_concurrency") or 32), 256))
     return cfg
 
 
@@ -947,6 +964,64 @@ def request_json(method: str, url: str, payload: dict[str, Any] | None, cfg: dic
     return parsed
 
 
+def proxy_url_enabled(value: Any) -> bool:
+    raw = clean_string(value)
+    return bool(raw) and raw.lower() not in {"direct", "none", "false", "0", "off", "no"}
+
+
+def build_proxy_opener(proxy_url: str):
+    return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+
+
+def validate_proxy_before_quota(cfg: dict[str, Any]) -> dict[str, Any]:
+    if not cfg.get("proxy_check_enabled", True):
+        return {"enabled": False, "ok": True, "skipped": True, "reason": "disabled"}
+    proxy_url = clean_string(cfg.get("proxy_url"))
+    if not proxy_url_enabled(proxy_url):
+        return {"enabled": False, "ok": True, "skipped": True, "reason": "no_proxy"}
+    lower = proxy_url.lower()
+    if not (lower.startswith("http://") or lower.startswith("https://")):
+        raise RuntimeError("代理预检失败：当前内置检测仅支持 http:// 或 https:// 代理，请检查 proxy_url")
+    check_url = clean_string(cfg.get("proxy_check_url")) or "https://chatgpt.com/cdn-cgi/trace"
+    timeout = int(cfg.get("proxy_check_timeout_seconds") or 8)
+    started = time.time()
+    req = urllib.request.Request(
+        check_url,
+        headers={"User-Agent": WHAM_HEADERS.get("User-Agent", "cliproxy-monitor")},
+        method="GET",
+    )
+    opener = build_proxy_opener(proxy_url)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", 200) or 200)
+            try:
+                resp.read(512)
+            except Exception:
+                pass
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        if status == 407 or status >= 500:
+            raise RuntimeError(f"代理预检失败：{check_url} 返回 HTTP {status}，请检查代理")
+        return {
+            "enabled": True,
+            "ok": True,
+            "url": check_url,
+            "status": status,
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+    except Exception as exc:
+        raise RuntimeError("代理预检失败：" + safe_short(str(exc), 220)) from exc
+    if status >= 500:
+        raise RuntimeError(f"代理预检失败：{check_url} 返回 HTTP {status}，请检查代理")
+    return {
+        "enabled": True,
+        "ok": True,
+        "url": check_url,
+        "status": status,
+        "elapsed_seconds": round(time.time() - started, 3),
+    }
+
+
 def request_json_direct(method: str, url: str, payload: dict[str, Any] | None, headers: dict[str, str], cfg: dict[str, Any]) -> dict[str, Any]:
     data = None
     if payload is not None:
@@ -954,8 +1029,8 @@ def request_json_direct(method: str, url: str, payload: dict[str, Any] | None, h
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     proxy_url = clean_string(cfg.get("proxy_url"))
     opener = None
-    if proxy_url and proxy_url.lower() not in {"direct", "none", "false"}:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+    if proxy_url_enabled(proxy_url):
+        opener = build_proxy_opener(proxy_url)
     try:
         if opener:
             with opener.open(req, timeout=int(cfg.get("quota_query_timeout_seconds") or 25)) as resp:
@@ -1372,27 +1447,51 @@ def preserve_cached_quota_on_transient_errors(reports: list[dict[str, Any]], pre
     return preserved
 
 
-def query_quota_reports_direct(cfg: dict[str, Any]) -> dict[str, Any]:
+def query_quota_reports_direct(
+    cfg: dict[str, Any],
+    target_files: set[str] | None = None,
+    merge_existing_cache: bool = False,
+    skip_proxy_check: bool = False,
+) -> dict[str, Any]:
     started = time.time()
+    proxy_check = {"enabled": False, "ok": True, "skipped": True, "reason": "prechecked"} if skip_proxy_check else validate_proxy_before_quota(cfg)
     previous_cache = load_quota_cache()
     accounts, warnings = scan_auth_accounts(cfg)
-    codex_accounts = [item for item in accounts if clean_string(item.get("type")).lower() == "codex"]
+    target_lookup = {clean_string(name).lower() for name in (target_files or set()) if clean_string(name)}
+    query_accounts = accounts
+    if target_lookup:
+        query_accounts = [item for item in accounts if clean_string(item.get("file")).lower() in target_lookup]
+    codex_accounts = [item for item in query_accounts if clean_string(item.get("type")).lower() == "codex"]
     reports: list[dict[str, Any]] = []
-    workers = max(1, min(int(cfg.get("quota_query_concurrency") or 8), 64))
+    workers = max(1, min(int(cfg.get("quota_query_concurrency") or 32), 256))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(query_one_codex_quota_direct, account, cfg) for account in codex_accounts]
         for future in concurrent.futures.as_completed(futures):
             reports.append(future.result())
     reports = preserve_cached_quota_on_transient_errors(reports, previous_cache)
     reports.sort(key=lambda item: (clean_string(item.get("status")), clean_string(item.get("name")).lower()))
+    output_reports = reports
+    if target_lookup and merge_existing_cache and isinstance(previous_cache, dict):
+        existing_reports = []
+        for report in previous_cache.get("reports") or []:
+            if not isinstance(report, dict):
+                continue
+            file_name = clean_string(report.get("file")).lower()
+            if file_name and file_name in target_lookup:
+                continue
+            existing_reports.append(report)
+        output_reports = existing_reports + reports
     payload = {
         "created_at": isoformat_local(),
         "elapsed_seconds": round(time.time() - started, 3),
         "auth_file_count": len(accounts),
         "codex_count": len(codex_accounts),
         "source": "direct_auth",
+        "partial_refresh": bool(target_lookup),
+        "refreshed_files": sorted(target_lookup),
+        "proxy_check": proxy_check,
         "warnings": warnings,
-        "reports": reports,
+        "reports": output_reports,
     }
     write_json(QUOTA_CACHE_PATH, payload)
     log_event("info", "CPA 额度查询完成", {"source": "direct_auth", "codex_count": len(codex_accounts), "elapsed_seconds": payload["elapsed_seconds"]})
@@ -1414,7 +1513,7 @@ def query_quota_reports(cfg: dict[str, Any]) -> dict[str, Any]:
         if provider == "codex":
             codex_entries.append(entry)
     reports: list[dict[str, Any]] = []
-    workers = max(1, min(int(cfg.get("quota_query_concurrency") or 8), 64))
+    workers = max(1, min(int(cfg.get("quota_query_concurrency") or 32), 256))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(query_one_codex_quota, entry, cfg) for entry in codex_entries]
         for future in concurrent.futures.as_completed(futures):
@@ -1612,6 +1711,424 @@ def export_available_accounts(cfg: dict[str, Any], refresh_quota: bool = True) -
     return result
 
 
+AUTH_RECORD_MARKERS = {
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "chatgpt_account_id",
+    "chatgptAccountId",
+    "account_id",
+    "accountID",
+    "email",
+    "type",
+    "provider",
+}
+
+IMPORT_CONTAINER_KEYS = (
+    "accounts",
+    "auths",
+    "files",
+    "items",
+    "data",
+    "records",
+    "tokens",
+    "credentials",
+    "results",
+)
+
+
+def ensure_import_dir() -> None:
+    ensure_data_dir()
+    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_last_import_result() -> dict[str, Any] | None:
+    payload = load_json(LAST_IMPORT_PATH, None)
+    return payload if isinstance(payload, dict) else None
+
+
+def looks_like_auth_record(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(key in value and value.get(key) not in (None, "") for key in AUTH_RECORD_MARKERS)
+
+
+def parse_json_bytes(raw: bytes) -> Any:
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            text = raw.decode(encoding)
+            return json.loads(text)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            break
+    if last_error:
+        raise last_error
+    raise ValueError("empty json")
+
+
+def parse_ndjson_bytes(raw: bytes) -> list[tuple[dict[str, Any], str]]:
+    text = raw.decode("utf-8-sig", errors="replace")
+    items: list[tuple[dict[str, Any], str]] = []
+    errors: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception as exc:
+            errors.append(f"line {lineno}: {exc}")
+            continue
+        if isinstance(parsed, dict):
+            items.append((parsed, f"line-{lineno}"))
+        elif isinstance(parsed, list):
+            for index, item in enumerate(parsed, 1):
+                if isinstance(item, dict):
+                    items.append((item, f"line-{lineno}-{index}"))
+    if not items:
+        detail = "; ".join(errors[:3])
+        raise ValueError("无法识别 JSON/NDJSON 账号数据" + (": " + detail if detail else ""))
+    return items
+
+
+def collect_import_accounts(payload: Any) -> list[tuple[dict[str, Any], str]]:
+    if isinstance(payload, list):
+        items = [(item, str(index)) for index, item in enumerate(payload, 1) if isinstance(item, dict)]
+        if items:
+            return items
+    if isinstance(payload, dict):
+        if looks_like_auth_record(payload):
+            return [(payload, "root")]
+        for key in IMPORT_CONTAINER_KEYS:
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                items = [(item, f"{key}-{index}") for index, item in enumerate(nested, 1) if isinstance(item, dict)]
+                if items:
+                    return items
+            if isinstance(nested, dict):
+                items = [(item, f"{key}-{name}") for name, item in nested.items() if isinstance(item, dict)]
+                if items:
+                    return items
+        mapped = [(item, str(name)) for name, item in payload.items() if isinstance(item, dict)]
+        auth_like = [(item, name) for item, name in mapped if looks_like_auth_record(item)]
+        if auth_like:
+            return auth_like
+        if len(mapped) > 1:
+            return mapped
+    raise ValueError("无法识别账号列表：支持单个 auth 对象、对象数组、accounts/auths/data/items 等字段、或 NDJSON")
+
+
+def parse_import_accounts(raw: bytes) -> list[tuple[dict[str, Any], str]]:
+    try:
+        payload = parse_json_bytes(raw)
+    except Exception:
+        return parse_ndjson_bytes(raw)
+    return collect_import_accounts(payload)
+
+
+def normalize_import_account(raw: dict[str, Any]) -> dict[str, Any]:
+    account = dict(raw)
+    provider = clean_string(account.get("provider"))
+    if provider and not clean_string(account.get("type")):
+        account["type"] = provider
+    if not clean_string(account.get("type")) and looks_like_auth_record(account):
+        account["type"] = "codex"
+    return account
+
+
+def safe_filename_part(value: Any, default: str = "account", max_len: int = 80) -> str:
+    raw = clean_string(value)
+    raw = re.sub(r"[^A-Za-z0-9._@+-]+", "_", raw).strip(" ._-")
+    if not raw:
+        raw = default
+    if len(raw) > max_len:
+        raw = raw[:max_len].rstrip(" ._-")
+    return raw or default
+
+
+def import_account_filename(
+    account: dict[str, Any],
+    index: int,
+    source_stem: str,
+    source_key: str,
+    used_names: set[str],
+) -> str:
+    provider = safe_filename_part(first_non_empty(account.get("type"), account.get("provider"), "codex"), "codex", 24)
+    identity = first_non_empty(account.get("email"), account.get("name"), parse_account_id(account), source_key, source_stem)
+    digest_source = json.dumps(account, ensure_ascii=False, sort_keys=True, default=str)
+    digest = short_hash(digest_source)
+    stem = safe_filename_part(f"{provider}_{identity}_{index:05d}_{digest}", f"{provider}_{index:05d}_{digest}", 150)
+    name = stem + ".json"
+    suffix = 1
+    while name.lower() in used_names:
+        suffix += 1
+        name = safe_filename_part(f"{stem}_{suffix}", f"{provider}_{index:05d}_{digest}_{suffix}", 150) + ".json"
+    used_names.add(name.lower())
+    return name
+
+
+def atomic_write_json_file(path: Path, payload: dict[str, Any]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_bytes(raw)
+    os.replace(str(tmp), str(path))
+    return len(raw)
+
+
+def upload_import_account(cfg: dict[str, Any], name: str, account: dict[str, Any], target_path: Path) -> tuple[str, str]:
+    api_error = ""
+    if cfg.get("import_try_management_upload", True) and clean_string(cfg.get("management_key")):
+        url = normalize_base_url(cfg["cpa_base_url"]) + "/v0/management/auth-files?name=" + urllib.parse.quote(name)
+        try:
+            request_json("POST", url, account, cfg)
+            return "management_api", ""
+        except Exception as exc:
+            api_error = safe_short(str(exc), 180)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json_file(target_path, account)
+    if api_error:
+        return "direct_auth_dir", "management_api_failed: " + api_error
+    return "direct_auth_dir", ""
+
+
+def write_and_upload_import_job(cfg: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    name = clean_string(job.get("name"))
+    account = job.get("account")
+    split_path = Path(job["split_path"])
+    auth_path = Path(job["auth_path"])
+    row = dict(job.get("row") or {})
+    try:
+        if not isinstance(account, dict):
+            raise ValueError("账号记录不是 JSON 对象")
+        size = atomic_write_json_file(split_path, account)
+        row["size_bytes"] = size
+        upload_mode, warning = upload_import_account(cfg, name, account, auth_path)
+        row["upload_mode"] = upload_mode
+        if warning:
+            row["warning"] = warning
+        row["uploaded"] = True
+        return {
+            "ok": True,
+            "row": row,
+            "warning": warning,
+            "record": {"name": name, "split_path": split_path, "auth_path": auth_path, "row": row},
+        }
+    except Exception as exc:
+        row["uploaded"] = False
+        row["error"] = safe_short(str(exc), 220)
+        return {"ok": False, "row": row, "warning": "", "record": None}
+
+
+def delete_imported_auth_from_cpa(cfg: dict[str, Any], file_name: str, file_path: Path | None) -> tuple[bool, str]:
+    if cfg.get("import_try_management_upload", True) and clean_string(cfg.get("management_key")):
+        url = normalize_base_url(cfg["cpa_base_url"]) + "/v0/management/auth-files?name=" + urllib.parse.quote(file_name)
+        try:
+            request_json("DELETE", url, None, cfg)
+            return True, "management_api_deleted"
+        except Exception as exc:
+            api_error = safe_short(str(exc), 180)
+            if file_path is None or not file_path.exists():
+                return False, "management_delete_failed: " + api_error
+    if file_path is not None and file_path.exists():
+        try:
+            file_path.unlink()
+            return True, "auth_dir_deleted"
+        except Exception as exc:
+            return False, safe_short(str(exc), 180)
+    return True, "already_removed"
+
+
+def zip_import_batch(batch_dir: Path, batch_id: str) -> Path:
+    zip_path = IMPORT_DIR / f"{batch_id}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for rel_dir in ("alive", "dead"):
+            folder = batch_dir / rel_dir
+            if not folder.exists():
+                continue
+            for path in sorted(folder.glob("*.json"), key=lambda item: item.name.lower()):
+                zf.write(path, arcname=f"{rel_dir}/{path.name}")
+        manifest = batch_dir / "manifest.json"
+        if manifest.exists():
+            zf.write(manifest, arcname="manifest.json")
+    return zip_path
+
+
+def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, refresh_quota: bool = True) -> dict[str, Any]:
+    auth_dir_text = clean_string(cfg.get("auth_dir"))
+    if not auth_dir_text:
+        raise RuntimeError("请先在 monitor_config.json 配置 auth_dir")
+    proxy_check = validate_proxy_before_quota(cfg) if refresh_quota else {"enabled": False, "ok": True, "skipped": True, "reason": "refresh_disabled"}
+    auth_dir = Path(auth_dir_text)
+    ensure_import_dir()
+    source_stem = safe_filename_part(Path(source_name or "accounts.json").stem, "accounts", 64)
+    batch_id = now_local().strftime("%Y%m%d_%H%M%S") + "_" + short_hash(source_name + str(len(raw)) + isoformat_local())
+    batch_dir = IMPORT_DIR / batch_id
+    split_dir = batch_dir / "split"
+    alive_dir = batch_dir / "alive"
+    dead_dir = batch_dir / "dead"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    alive_dir.mkdir(parents=True, exist_ok=True)
+    dead_dir.mkdir(parents=True, exist_ok=True)
+
+    parsed_accounts = parse_import_accounts(raw)
+    used_names: set[str] = set()
+    records: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    result = {
+        "ok": True,
+        "ran_at": isoformat_local(),
+        "source_file": source_name,
+        "source_size_bytes": len(raw),
+        "batch_id": batch_id,
+        "batch_dir": str(batch_dir),
+        "split_dir": str(split_dir),
+        "alive_dir": str(alive_dir),
+        "dead_dir": str(dead_dir),
+        "download_url": f"/api/download-import?name={urllib.parse.quote(batch_id + '.zip')}",
+        "proxy_check": proxy_check,
+        "upload_concurrency": int(cfg.get("import_upload_concurrency") or 32),
+        "quota_concurrency": int(cfg.get("quota_query_concurrency") or 32),
+        "detected": len(parsed_accounts),
+        "split": 0,
+        "uploaded": 0,
+        "alive": 0,
+        "dead": 0,
+        "errors": 0,
+        "warnings": warnings,
+        "items": [],
+    }
+
+    with CLEANUP_LOCK:
+        jobs: list[dict[str, Any]] = []
+        for index, (raw_account, source_key) in enumerate(parsed_accounts, 1):
+            if not isinstance(raw_account, dict):
+                result["errors"] += 1
+                continue
+            account = normalize_import_account(raw_account)
+            name = import_account_filename(account, index, source_stem, source_key, used_names)
+            split_path = split_dir / name
+            auth_path = auth_dir / name
+            row = {
+                "file": name,
+                "email": clean_string(account.get("email")),
+                "name": clean_string(account.get("name")),
+                "source_key": source_key,
+                "split_path": str(split_path),
+                "auth_path": str(auth_path),
+            }
+            jobs.append({"name": name, "account": account, "split_path": split_path, "auth_path": auth_path, "row": row})
+
+        upload_workers = max(1, min(int(cfg.get("import_upload_concurrency") or 32), 256))
+        if jobs:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=upload_workers) as executor:
+                future_map = {executor.submit(write_and_upload_import_job, cfg, job): job for job in jobs}
+                for future in concurrent.futures.as_completed(future_map):
+                    outcome = future.result()
+                    row = outcome.get("row") if isinstance(outcome, dict) else {}
+                    if isinstance(outcome, dict) and outcome.get("ok"):
+                        result["split"] += 1
+                        result["uploaded"] += 1
+                        warning = clean_string(outcome.get("warning"))
+                        if warning:
+                            warnings.append(f"{row.get('file')}: {warning}")
+                        record = outcome.get("record")
+                        if isinstance(record, dict):
+                            records.append(record)
+                    else:
+                        result["errors"] += 1
+                    result["items"].append(row)
+
+        imported_names = {record["name"] for record in records}
+        cache = load_quota_cache()
+        if refresh_quota and imported_names:
+            try:
+                with QUOTA_LOCK:
+                    cache = query_quota_reports_direct(
+                        cfg,
+                        target_files={str(name) for name in imported_names},
+                        merge_existing_cache=True,
+                        skip_proxy_check=True,
+                    )
+            except Exception as exc:
+                warning = "导入后额度/存活检测失败，已停止归档和删除，避免误判死亡账号: " + safe_short(str(exc), 180)
+                warnings.append(warning)
+                log_event("error", "导入账号后检测失败", {"error": str(exc)})
+                raise RuntimeError(warning) from exc
+
+        accounts, scan_warnings = scan_auth_accounts(cfg)
+        warnings.extend(scan_warnings)
+        by_file = {clean_string(account.get("file")).lower(): account for account in accounts}
+        target_accounts = [by_file[name.lower()] for name in imported_names if name.lower() in by_file]
+        target_accounts = merge_quota(target_accounts, cache)
+        by_file = {clean_string(account.get("file")).lower(): account for account in target_accounts}
+        threshold = float(cfg.get("quota_low_threshold_percent") or 5)
+
+        for record in records:
+            name = clean_string(record["name"])
+            split_path = Path(record["split_path"])
+            auth_path = Path(record["auth_path"])
+            account = by_file.get(name.lower())
+            ok = False
+            reason = "not_found_after_upload"
+            quota: dict[str, Any] = {}
+            account_file_path: Path | None = auth_path if auth_path.exists() else None
+            if account:
+                ok, reason = account_is_exportable(account, require_quota=True, threshold=threshold)
+                if isinstance(account.get("quota"), dict):
+                    quota = account["quota"]
+                file_text = clean_string(account.get("_file_path"))
+                if file_text:
+                    candidate = Path(file_text)
+                    if candidate.exists():
+                        account_file_path = candidate
+            archive_dir = alive_dir if ok else dead_dir
+            archive_path = archive_dir / name
+            item = record["row"]
+            item["status"] = clean_string(account.get("status")) if account else ""
+            item["quota_status"] = clean_string(quota.get("status")) if quota else ""
+            item["quota_error"] = clean_string(quota.get("error")) if quota else ""
+            item["min_remaining_percent"] = quota.get("min_remaining_percent") if quota else None
+            item["reason"] = reason
+            item["alive"] = ok
+            try:
+                source_for_archive = account_file_path if account_file_path and account_file_path.exists() else split_path
+                shutil.copy2(source_for_archive, archive_path)
+                item["archive_path"] = str(archive_path)
+                if ok:
+                    result["alive"] += 1
+                    if not cfg.get("import_keep_alive_in_auth_dir", True):
+                        removed, remove_reason = delete_imported_auth_from_cpa(cfg, name, account_file_path)
+                        item["removed_from_auth_dir"] = removed
+                        item["remove_reason"] = remove_reason
+                else:
+                    result["dead"] += 1
+                    if cfg.get("import_move_dead_from_auth_dir", True):
+                        removed, remove_reason = delete_imported_auth_from_cpa(cfg, name, account_file_path)
+                        item["removed_from_auth_dir"] = removed
+                        item["remove_reason"] = remove_reason
+            except Exception as exc:
+                item["classify_error"] = safe_short(str(exc), 220)
+                result["errors"] += 1
+
+    result["zip"] = str(IMPORT_DIR / f"{batch_id}.zip")
+    manifest = sanitize_for_output(result)
+    manifest_path = batch_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    zip_path = zip_import_batch(batch_dir, batch_id)
+    result["zip"] = str(zip_path)
+    write_json(LAST_IMPORT_PATH, sanitize_for_output(result))
+    log_event(
+        "info",
+        "大 JSON 导入检测完成",
+        {"detected": result["detected"], "uploaded": result["uploaded"], "alive": result["alive"], "dead": result["dead"], "errors": result["errors"], "batch_dir": str(batch_dir)},
+    )
+    return result
+
+
 def build_summary(accounts: list[dict[str, Any]], cache: dict[str, Any] | None) -> dict[str, Any]:
     total = len(accounts)
     disabled = sum(1 for item in accounts if item.get("disabled"))
@@ -1665,10 +2182,17 @@ def public_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "proxy_url_configured": bool(clean_string(cfg.get("proxy_url"))),
         "quota_low_threshold_percent": cfg.get("quota_low_threshold_percent"),
         "quota_query_concurrency": cfg.get("quota_query_concurrency"),
+        "proxy_check_enabled": bool(cfg.get("proxy_check_enabled", True)),
+        "proxy_check_url": cfg.get("proxy_check_url"),
+        "proxy_check_timeout_seconds": cfg.get("proxy_check_timeout_seconds"),
         "auto_cleanup_enabled": bool(cfg.get("auto_cleanup_enabled")),
         "auto_cleanup_interval_seconds": cfg.get("auto_cleanup_interval_seconds"),
         "cleanup_delete_quota_low": bool(cfg.get("cleanup_delete_quota_low", True)),
         "cleanup_quarantine_dir": cfg.get("cleanup_quarantine_dir"),
+        "import_keep_alive_in_auth_dir": bool(cfg.get("import_keep_alive_in_auth_dir", True)),
+        "import_move_dead_from_auth_dir": bool(cfg.get("import_move_dead_from_auth_dir", True)),
+        "import_try_management_upload": bool(cfg.get("import_try_management_upload", True)),
+        "import_upload_concurrency": cfg.get("import_upload_concurrency"),
     }
 
 
@@ -1696,6 +2220,7 @@ def build_status_payload() -> dict[str, Any]:
         "cleanup_stats": sanitize_for_output(cleanup_count_stats),
         "cleanup_recent": cleanup_recent,
         "cleanup_recent_hours": CLEANUP_DISPLAY_HOURS,
+        "last_import": sanitize_for_output(read_last_import_result()),
         "events": read_recent_events(80),
     }
 
@@ -1933,6 +2458,33 @@ def render_index() -> str:
       margin-bottom: 12px;
       font-size: 13px;
     }
+    .import-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 14px;
+    }
+    .import-grid {
+      display: grid;
+      grid-template-columns: minmax(240px, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .import-grid input[type="file"] {
+      width: 100%;
+      border: 1px dashed #b9c1cc;
+      border-radius: 6px;
+      padding: 8px;
+      background: #fbfbf9;
+    }
+    .import-result {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      word-break: break-all;
+    }
     .cleanup-log {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -2044,6 +2596,7 @@ def render_index() -> str:
       .section-head { align-items: stretch; flex-direction: column; }
       .tools { width: 100%; }
       .search { width: 100%; }
+      .import-grid { grid-template-columns: 1fr; }
       th, td { padding: 8px; }
     }
   </style>
@@ -2065,6 +2618,17 @@ def render_index() -> str:
     <div id="notice"></div>
     <div class="status-line" id="statusLine"></div>
     <div class="metrics" id="metrics"></div>
+    <section class="import-panel">
+      <div class="section-head">
+        <h2>大 JSON 一键导入检测</h2>
+        <div class="muted">自动识别数组 / accounts / auths / NDJSON，拆成单账号 JSON 后导入 CPA 并按存活归档</div>
+      </div>
+      <div class="import-grid">
+        <input id="importFile" type="file" accept=".json,.jsonl,.ndjson,application/json">
+        <button class="primary" id="importBatchBtn">选择文件并开始检测</button>
+      </div>
+      <div class="import-result" id="importResult"></div>
+    </section>
     <section id="cleanupLogSection"></section>
     <div class="split">
       <section>
@@ -2191,6 +2755,28 @@ def render_index() -> str:
       const email = account.email || account.name || '(无邮箱)';
       return `<div>${h(email)}</div><div class="muted mono">${h(account.type || 'codex')}</div>`;
     }
+    function renderImportResult(result) {
+      const target = $('importResult');
+      if (!target) return;
+      if (!result) {
+        target.innerHTML = '<span class="muted">还没有导入记录。选择一个大 JSON 后点击开始检测。</span>';
+        return;
+      }
+      const download = result.download_url ? ` · <a href="${h(result.download_url)}" target="_blank">下载归档 zip</a>` : '';
+      const proxy = result.proxy_check || {};
+      const proxyText = proxy.enabled ? `代理预检 HTTP ${h(proxy.status || 'ok')} / ${h(proxy.elapsed_seconds || 0)}s` : `代理预检 ${h(proxy.reason || '跳过')}`;
+      target.innerHTML = [
+        `<b>最近导入：</b>${h(result.source_file || result.batch_id || '-')}`,
+        `识别 ${h(result.detected ?? 0)} 个，拆分 ${h(result.split ?? 0)} 个，上传 ${h(result.uploaded ?? 0)} 个`,
+        `并发：上传 ${h(result.upload_concurrency || '-')} / 检测 ${h(result.quota_concurrency || '-')}`,
+        proxyText,
+        `<span class="pill good">存活 ${h(result.alive ?? 0)}</span>`,
+        `<span class="pill bad">死亡 ${h(result.dead ?? 0)}</span>`,
+        `<span class="pill ${result.errors ? 'bad' : 'good'}">错误 ${h(result.errors ?? 0)}</span>`,
+        `<br>存活目录：<span class="mono">${h(result.alive_dir || '-')}</span>`,
+        `<br>死亡目录：<span class="mono">${h(result.dead_dir || '-')}</span>${download}`
+      ].join(' · ');
+    }
     function render(data) {
       state = data;
       const cfg = data.config || {};
@@ -2225,6 +2811,9 @@ def render_index() -> str:
         `<span class="pill good">页面 ${h(data.generated_at || '-')}</span>`,
         `<span class="pill good">额度模式 ${h(cfg.quota_query_mode || 'direct_auth')}</span>`,
         `<span class="pill ${cfg.proxy_url_configured ? 'good' : 'warn'}">代理 ${cfg.proxy_url_configured ? '已配置' : '未配置'}</span>`,
+        `<span class="pill ${cfg.proxy_check_enabled ? 'good' : 'warn'}">代理预检 ${cfg.proxy_check_enabled ? '开启' : '关闭'}</span>`,
+        `<span class="pill good">检测并发 ${h(cfg.quota_query_concurrency || 32)}</span>`,
+        `<span class="pill good">导入并发 ${h(cfg.import_upload_concurrency || 32)}</span>`,
         `<span class="pill">低额度阈值 ${h(cfg.quota_low_threshold_percent)}%</span>`,
         `<span class="pill ${cfg.auto_cleanup_enabled ? 'good' : 'warn'}">${cleanupStatusText}</span>`,
         `<span class="pill ${cfg.cleanup_delete_quota_low ? 'good' : 'warn'}">\u4f4e\u4e8e5%\u5220\u9664 ${cfg.cleanup_delete_quota_low ? '\u5df2\u542f\u7528' : '\u5df2\u5173\u95ed'}</span>`,
@@ -2232,6 +2821,7 @@ def render_index() -> str:
       ].filter(Boolean).join('');
       renderProblems(data.accounts || []);
       renderCleanupLog(cleanupRecent, data.cleanup_recent_hours || 12);
+      renderImportResult(data.import || data.last_import || null);
       renderAccounts(data.accounts || []);
       renderLogs(data.events || []);
     }
@@ -2390,6 +2980,42 @@ def render_index() -> str:
         btn.textContent = '导出可用账号';
       }
     }
+    async function importBatchAccounts() {
+      const input = $('importFile');
+      const btn = $('importBatchBtn');
+      const file = input && input.files && input.files[0];
+      if (!file) {
+        alert('请先选择一个 JSON / JSONL 文件');
+        return;
+      }
+      if (!confirm(`开始导入并检测 ${file.name}？\n\n系统会拆分为单账号 JSON，上传到 CPA，然后把存活账号复制到 alive 文件夹，把死亡账号归档到 dead 文件夹。`)) return;
+      btn.disabled = true;
+      btn.textContent = '导入检测中...';
+      $('importResult').innerHTML = '<span class="muted">正在上传、拆分、检测，请保持页面打开...</span>';
+      try {
+        const body = await file.arrayBuffer();
+        const url = `/api/import-batch?refresh=1&filename=${encodeURIComponent(file.name)}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/octet-stream'},
+          body,
+          cache: 'no-store'
+        });
+        const data = await res.json();
+        render(data);
+        const result = data.import || {};
+        if (data.import_error) {
+          alert('导入失败：' + data.import_error);
+        } else {
+          alert(`导入检测完成：识别 ${result.detected ?? 0} 个，存活 ${result.alive ?? 0} 个，死亡 ${result.dead ?? 0} 个，错误 ${result.errors ?? 0} 个。\n\n存活目录：${result.alive_dir || '-'}\n死亡目录：${result.dead_dir || '-'}`);
+        }
+      } catch (err) {
+        alert('导入失败：' + err);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '选择文件并开始检测';
+      }
+    }
     async function toggleAutoCleanup() {
       const cfg = state && state.config ? state.config : {};
       const nextEnabled = !cfg.auto_cleanup_enabled;
@@ -2468,6 +3094,7 @@ def render_index() -> str:
     $('lowQuotaDeleteBtn').addEventListener('click', toggleLowQuotaDelete);
     $('quotaBtn').addEventListener('click', queryQuota);
     $('exportAvailableBtn').addEventListener('click', exportAvailableAccounts);
+    $('importBatchBtn').addEventListener('click', importBatchAccounts);
     $('deleteTeamBtn').addEventListener('click', deleteTeamAccounts);
     $('search').addEventListener('input', () => state && renderAccounts(state.accounts || []));
     loadStatus();
@@ -2523,6 +3150,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/download-export":
             self.handle_download_export(parsed)
             return
+        if path == "/api/download-import":
+            self.handle_download_import(parsed)
+            return
         if path == "/favicon.ico":
             self.send_bytes(404, b"", "text/plain")
             return
@@ -2547,6 +3177,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/export-available":
             self.handle_export_available(parsed)
+            return
+        if parsed.path == "/api/import-batch":
+            self.handle_import_batch(parsed)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
@@ -2595,6 +3228,67 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f'attachment; filename="{resolved_path.name}"')
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_download_import(self, parsed: urllib.parse.ParseResult) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        name = clean_string((query.get("name") or [""])[-1])
+        if not name or name != Path(name).name or not name.lower().endswith(".zip"):
+            self.send_json({"ok": False, "error": "invalid import name"}, 400)
+            return
+        path = IMPORT_DIR / name
+        try:
+            resolved_import_dir = IMPORT_DIR.resolve()
+            resolved_path = path.resolve()
+        except Exception:
+            self.send_json({"ok": False, "error": "invalid import path"}, 400)
+            return
+        if resolved_import_dir not in resolved_path.parents or not resolved_path.exists() or not resolved_path.is_file():
+            self.send_json({"ok": False, "error": "import archive not found"}, 404)
+            return
+        try:
+            body = resolved_path.read_bytes()
+        except Exception as exc:
+            self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", f'attachment; filename="{resolved_path.name}"')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_import_batch(self, parsed: urllib.parse.ParseResult) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        file_name = clean_string((query.get("filename") or query.get("name") or ["accounts.json"])[-1]) or "accounts.json"
+        file_name = Path(file_name).name or "accounts.json"
+        refresh = (query.get("refresh") or ["1"])[-1] not in {"0", "false", "no", "off"}
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self.send_json({"ok": False, "error": "empty upload"}, 400)
+            return
+        try:
+            raw = self.rfile.read(length)
+        except Exception as exc:
+            self.send_json({"ok": False, "error": "read upload failed: " + str(exc)}, 400)
+            return
+        cfg = load_config()
+        try:
+            with IMPORT_LOCK:
+                result = import_large_json_batch(cfg, file_name, raw, refresh_quota=refresh)
+        except Exception as exc:
+            log_event("error", "大 JSON 导入失败", {"file": file_name, "error": str(exc)})
+            payload = build_status_payload()
+            payload["ok"] = False
+            payload["import_error"] = str(exc)
+            self.send_json(payload, 200)
+            return
+        payload = build_status_payload()
+        payload["import"] = sanitize_for_output(result)
+        self.send_json(payload)
 
     def handle_quota(self) -> None:
         cfg = load_config()

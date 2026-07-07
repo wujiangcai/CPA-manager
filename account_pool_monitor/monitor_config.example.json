@@ -9,9 +9,12 @@
   "proxy_url": "",
   "quota_low_threshold_percent": 5,
   "quota_query_timeout_seconds": 25,
-  "quota_query_concurrency": 8,
+  "quota_query_concurrency": 32,
   "quota_query_retries": 3,
   "quota_delete_cache_max_age_seconds": 600,
+  "proxy_check_enabled": true,
+  "proxy_check_url": "https://chatgpt.com/cdn-cgi/trace",
+  "proxy_check_timeout_seconds": 8,
   "auto_cleanup_enabled": false,
   "auto_cleanup_interval_seconds": 3600,
   "cleanup_delete_quota_low": false,
@@ -20,5 +23,9 @@
   "cleanup_move_expired": true,
   "cleanup_move_missing_tokens": true,
   "cleanup_move_read_errors": true,
-  "cleanup_move_access_expired": false
+  "cleanup_move_access_expired": false,
+  "import_keep_alive_in_auth_dir": true,
+  "import_move_dead_from_auth_dir": true,
+  "import_try_management_upload": true,
+  "import_upload_concurrency": 32
 }
