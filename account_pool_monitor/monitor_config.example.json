@@ -27,5 +27,10 @@
   "import_keep_alive_in_auth_dir": true,
   "import_move_dead_from_auth_dir": true,
   "import_try_management_upload": true,
-  "import_upload_concurrency": 32
+  "import_upload_concurrency": 32,
+  "import_max_bytes": 536870912,
+  "remote_pool_base_url": "https://YOUR_REMOTE_CPA_HOST",
+  "remote_pool_management_key": "",
+  "remote_pool_upload_concurrency": 16,
+  "remote_pool_timeout_seconds": 25
 }

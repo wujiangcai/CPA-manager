@@ -2,15 +2,26 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+import urllib.parse
 import urllib.request
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-HOST = "127.0.0.1"
-PORT = 18321
-USAGE_URL = "http://127.0.0.1:18319/"
-POOL_URL = "http://127.0.0.1:18320/"
+def env_port(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(1, min(65535, value))
+
+
+HOST = os.environ.get("CPA_DASHBOARD_HOST", "127.0.0.1")
+PORT = env_port("CPA_DASHBOARD_PORT", 18321)
+USAGE_URL = os.environ.get("CPA_USAGE_MONITOR_URL", "http://127.0.0.1:18319/").rstrip("/") + "/"
+POOL_URL = os.environ.get("CPA_POOL_MONITOR_URL", "http://127.0.0.1:18320/").rstrip("/") + "/"
 
 
 def fetch_text(url: str, timeout: int = 3) -> str:
@@ -22,7 +33,7 @@ def fetch_text(url: str, timeout: int = 3) -> str:
 
 
 def render_page() -> str:
-    return """<!doctype html>
+    page = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -64,8 +75,8 @@ def render_page() -> str:
     </div>
   </header>
   <main class="frame-wrap">
-    <iframe id="usageFrame" class="active" src="http://127.0.0.1:18319/"></iframe>
-    <iframe id="poolFrame" src="http://127.0.0.1:18320/"></iframe>
+    <iframe id="usageFrame" class="active" src="__USAGE_URL__"></iframe>
+    <iframe id="poolFrame" src="__POOL_URL__"></iframe>
   </main>
   <script>
     function showTab(name) {
@@ -85,6 +96,7 @@ def render_page() -> str:
   </script>
 </body>
 </html>"""
+    return page.replace("__USAGE_URL__", html_escape(USAGE_URL, quote=True)).replace("__POOL_URL__", html_escape(POOL_URL, quote=True))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -106,17 +118,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(status, raw, "application/json; charset=utf-8")
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/":
             self.send_bytes(200, render_page().encode("utf-8"), "text/html; charset=utf-8")
             return
-        if self.path.startswith("/api/ping"):
+        if path == "/api/ping":
             self.send_json({
                 "ok": True,
                 "name": "zny CPA detection dashboard",
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "dashboard": f"http://{HOST}:{PORT}/",
-                "usage_ping": fetch_text("http://127.0.0.1:18319/ping"),
-                "pool_ping": fetch_text("http://127.0.0.1:18320/api/ping"),
+                "usage_ping": fetch_text(urllib.parse.urljoin(USAGE_URL, "ping")),
+                "pool_ping": fetch_text(urllib.parse.urljoin(POOL_URL, "api/ping")),
             })
             return
         self.send_json({"ok": False, "error": "not found"}, 404)

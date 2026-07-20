@@ -1,4 +1,5 @@
 import http.client
+import hashlib
 import json
 import os
 import sqlite3
@@ -151,22 +152,46 @@ def load_config():
     return config
 
 
+def config_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def config_int(value, default, minimum, maximum=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    parsed = max(int(minimum), parsed)
+    if maximum is not None:
+        parsed = min(int(maximum), parsed)
+    return parsed
+
+
 CONFIG = load_config()
 HOST = str(os.environ.get("CPA_USAGE_MONITOR_HOST") or CONFIG.get("host") or "127.0.0.1")
-PORT = int(os.environ.get("CPA_USAGE_MONITOR_PORT") or CONFIG.get("port") or 18319)
+PORT = config_int(os.environ.get("CPA_USAGE_MONITOR_PORT") or CONFIG.get("port"), 18319, 1, 65535)
 UPSTREAM_BASE_URL = str(CONFIG.get("upstream_base_url") or "").rstrip("/")
 UPSTREAM_API_KEY = str(
     os.environ.get(str(CONFIG.get("upstream_api_key_env") or "CPA_MONITOR_UPSTREAM_API_KEY"))
     or CONFIG.get("upstream_api_key")
     or ""
 )
-PRESERVE_CLIENT_AUTHORIZATION = bool(CONFIG.get("preserve_client_authorization", True))
+PRESERVE_CLIENT_AUTHORIZATION = config_bool(CONFIG.get("preserve_client_authorization"), True)
 DATA_DIR = resolve_app_path(CONFIG.get("data_dir"), "monitor_data")
 PRICE_FILE = resolve_app_path(CONFIG.get("price_file"), "model_prices.json")
 USAGE_DB = DATA_DIR / "usage.sqlite3"
-CONNECT_TIMEOUT = max(1, int(CONFIG.get("connect_timeout_seconds", 15)))
-READ_TIMEOUT = max(1, int(CONFIG.get("read_timeout_seconds", 900)))
-MAX_BODY_BYTES = max(1024, int(CONFIG.get("max_body_bytes", 104857600)))
+CONNECT_TIMEOUT = config_int(CONFIG.get("connect_timeout_seconds"), 15, 1, 300)
+READ_TIMEOUT = config_int(CONFIG.get("read_timeout_seconds"), 900, 1, 86400)
+MAX_BODY_BYTES = config_int(CONFIG.get("max_body_bytes"), 104857600, 1024, 2147483648)
 
 
 def ensure_price_file():
@@ -419,8 +444,8 @@ def account_from_headers(headers):
         return explicit[:120]
     token = parse_bearer(headers.get("Authorization"))
     if token:
-        tail = token[-8:] if len(token) > 8 else token
-        return "self:" + tail
+        digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return "self:" + digest
     return "self/local"
 
 
@@ -446,7 +471,10 @@ def read_body(handler):
         raise MonitorError(400, "Invalid Content-Length", "bad_request")
     if length > MAX_BODY_BYTES:
         raise MonitorError(413, "Request body is too large", "request_too_large")
-    return handler.rfile.read(length) if length else b""
+    body = handler.rfile.read(length) if length else b""
+    if len(body) != length:
+        raise MonitorError(400, "Incomplete request body", "bad_request")
+    return body
 
 
 def target_url(incoming_path):
@@ -1142,6 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
         total_tokens = 0
         status = 500
         error_type = ""
+        self._response_started = False
 
         try:
             if path in {"/ping", "/health"}:
@@ -1196,7 +1225,10 @@ class Handler(BaseHTTPRequestHandler):
         except MonitorError as exc:
             status = exc.status
             error_type = exc.error_type
-            self.send_error_json(exc)
+            if self._response_started:
+                self.close_connection = True
+            else:
+                self.send_error_json(exc)
         except BrokenPipeError:
             status = 499
             error_type = "client_disconnected"
@@ -1204,10 +1236,13 @@ class Handler(BaseHTTPRequestHandler):
             status = 502
             error_type = "monitor_exception"
             traceback.print_exc()
-            try:
-                self.send_error_json(MonitorError(502, "Monitor failed to proxy the request", "monitor_exception"))
-            except Exception:
-                pass
+            if self._response_started:
+                self.close_connection = True
+            else:
+                try:
+                    self.send_error_json(MonitorError(502, "Monitor failed to proxy the request", "monitor_exception"))
+                except Exception:
+                    pass
         finally:
             if should_log:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1280,6 +1315,7 @@ class Handler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
             ttft_ms = int((time.perf_counter() - proxy_started) * 1000)
             self.send_response(resp.status, resp.reason)
+            self._response_started = True
             for key, value in resp.getheaders():
                 lower = key.lower()
                 if lower == "content-type":
@@ -1310,6 +1346,8 @@ class Handler(BaseHTTPRequestHandler):
             return {"status": resp.status, "bytes_out": bytes_out, "ttft_ms": ttft_ms, "usage": usage_info}
         except TimeoutError:
             raise MonitorError(504, "Upstream timeout", "upstream_timeout")
+        except BrokenPipeError:
+            raise
         except OSError as exc:
             raise MonitorError(502, "Upstream connection failed: " + str(exc), "upstream_connection_failed")
         finally:

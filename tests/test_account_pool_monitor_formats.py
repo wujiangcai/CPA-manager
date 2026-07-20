@@ -4,8 +4,11 @@ import base64
 import importlib.util
 import json
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -334,9 +337,281 @@ class ImportFormatTests(unittest.TestCase):
                 "refresh_token": "two",
                 "idToken": "three",
                 "session_token": "four",
+                "remote_pool_management_key": "five",
             }
         )
         self.assertEqual(set(sanitized.values()), {"[hidden]"})
+
+    def test_selected_alive_account_is_uploaded_to_remote_pool_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "monitor_data"
+            import_dir = data_dir / "import_batches"
+            batch_id = "20260720_testbatch"
+            alive_dir = import_dir / batch_id / "alive"
+            alive_dir.mkdir(parents=True)
+            first = {
+                "type": "codex",
+                "account_id": "remote-one",
+                "access_token": "access-one",
+                "refresh_token": "refresh-one",
+                "email": "one@example.com",
+            }
+            second = {
+                "type": "codex",
+                "account_id": "remote-two",
+                "access_token": "access-two",
+                "refresh_token": "refresh-two",
+                "email": "two@example.com",
+            }
+            (alive_dir / "one.json").write_text(json.dumps(first), encoding="utf-8")
+            (alive_dir / "two.json").write_text(json.dumps(second), encoding="utf-8")
+            last_import_path = data_dir / "last_import_result.json"
+            last_import_path.parent.mkdir(parents=True, exist_ok=True)
+            last_import_path.write_text(
+                json.dumps(
+                    {
+                        "batch_id": batch_id,
+                        "items": [
+                            {"file": "one.json", "email": "one@example.com", "alive": True},
+                            {"file": "two.json", "email": "two@example.com", "alive": True},
+                            {"file": "dead.json", "email": "dead@example.com", "alive": False},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = {
+                "remote_pool_base_url": "https://remote.example.com",
+                "remote_pool_management_key": "remote-key",
+                "remote_pool_upload_concurrency": 4,
+                "remote_pool_timeout_seconds": 10,
+            }
+            uploaded: list[tuple[str, dict[str, object]]] = []
+
+            def fake_upload(_cfg: dict[str, object], name: str, account: dict[str, object]) -> dict[str, object]:
+                uploaded.append((name, account))
+                return {"status": 200, "bytes": 100}
+
+            patched_paths = {
+                "DATA_DIR": data_dir,
+                "IMPORT_DIR": import_dir,
+                "LAST_IMPORT_PATH": last_import_path,
+                "EVENT_LOG_PATH": data_dir / "events.jsonl",
+            }
+            with (
+                mock.patch.multiple(monitor, **patched_paths),
+                mock.patch.object(monitor, "upload_one_remote_pool_account", side_effect=fake_upload),
+            ):
+                result = monitor.submit_alive_accounts_to_remote_pool(cfg, batch_id, ["two.json", "two.json"])
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["requested"], 1)
+            self.assertEqual(result["uploaded"], 1)
+            self.assertEqual([item[0] for item in uploaded], ["two.json"])
+            self.assertEqual(uploaded[0][1]["account_id"], "remote-two")
+            persisted = json.loads(last_import_path.read_text(encoding="utf-8"))
+            by_file = {item["file"]: item for item in persisted["items"]}
+            self.assertNotIn("remote_uploaded", by_file["one.json"])
+            self.assertTrue(by_file["two.json"]["remote_uploaded"])
+            self.assertEqual(persisted["remote_upload"]["uploaded"], 1)
+
+    def test_remote_pool_rejects_non_alive_or_path_traversal_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "monitor_data"
+            import_dir = data_dir / "import_batches"
+            batch_id = "batch_safe"
+            alive_dir = import_dir / batch_id / "alive"
+            alive_dir.mkdir(parents=True)
+            last_import_path = data_dir / "last_import_result.json"
+            last_import_path.write_text(
+                json.dumps({"batch_id": batch_id, "items": [{"file": "dead.json", "alive": False}]}),
+                encoding="utf-8",
+            )
+            cfg = {
+                "remote_pool_base_url": "https://remote.example.com",
+                "remote_pool_management_key": "remote-key",
+            }
+            with mock.patch.multiple(
+                monitor,
+                DATA_DIR=data_dir,
+                IMPORT_DIR=import_dir,
+                LAST_IMPORT_PATH=last_import_path,
+                EVENT_LOG_PATH=data_dir / "events.jsonl",
+            ):
+                with self.assertRaisesRegex(ValueError, "只能提交已通过验活"):
+                    monitor.submit_alive_accounts_to_remote_pool(cfg, batch_id, ["dead.json"])
+                with self.assertRaisesRegex(ValueError, "只能提交已通过验活"):
+                    monitor.submit_alive_accounts_to_remote_pool(cfg, batch_id, ["../outside.json"])
+
+    def test_remote_pool_http_upload_uses_management_api_and_bearer_key(self) -> None:
+        class FakeResponse:
+            status = 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"ok":true}'
+
+        cfg = {
+            "remote_pool_base_url": "https://remote.example.com/base",
+            "remote_pool_management_key": "remote-secret-key",
+            "remote_pool_timeout_seconds": 19,
+        }
+        account = {"type": "codex", "access_token": "example-access", "account_id": "account-one"}
+        with mock.patch.object(monitor.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen:
+            result = monitor.upload_one_remote_pool_account(cfg, "account one.json", account)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(result["status"], 201)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+        self.assertEqual(
+            request.full_url,
+            "https://remote.example.com/base/v0/management/auth-files?name=account%20one.json",
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer remote-secret-key")
+        self.assertEqual(json.loads(request.data.decode("utf-8"))["account_id"], "account-one")
+
+    def test_remote_pool_http_endpoint_accepts_selected_files(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_submit(_cfg: dict[str, object], batch_id: str, files: list[str]) -> dict[str, object]:
+            captured["batch_id"] = batch_id
+            captured["files"] = files
+            return {"ok": True, "batch_id": batch_id, "requested": len(files), "uploaded": len(files), "failed": 0}
+
+        with (
+            mock.patch.object(monitor, "load_config", return_value={}),
+            mock.patch.object(monitor, "submit_alive_accounts_to_remote_pool", side_effect=fake_submit),
+            mock.patch.object(monitor, "build_status_payload", return_value={"ok": True, "last_import": {}}),
+        ):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                body = json.dumps({"batch_id": "batch_http", "files": ["one.json", "two.json"]}).encode("utf-8")
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/api/remote-pool/upload",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(captured, {"batch_id": "batch_http", "files": ["one.json", "two.json"]})
+        self.assertEqual(payload["remote_upload"]["uploaded"], 2)
+
+    def test_import_without_refresh_does_not_archive_accounts_as_dead_without_cache(self) -> None:
+        account_id = "no-cache-account"
+        cpa = {
+            "type": "codex",
+            "account_id": account_id,
+            "email": "nocache@example.com",
+            "access_token": access_token(account_id, "nocache@example.com"),
+            "refresh_token": "refresh-value",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            auth_dir = root / "auth"
+            data_dir = root / "monitor_data"
+            import_dir = data_dir / "import_batches"
+            cfg = {
+                "auth_dir": str(auth_dir),
+                "cpa_base_url": "http://127.0.0.1:8317",
+                "management_key": "",
+                "import_try_management_upload": False,
+                "import_keep_alive_in_auth_dir": True,
+                "import_move_dead_from_auth_dir": True,
+                "import_upload_concurrency": 1,
+                "quota_query_concurrency": 1,
+                "quota_low_threshold_percent": 5,
+                "quota_delete_cache_max_age_seconds": 600,
+            }
+            patched_paths = {
+                "DATA_DIR": data_dir,
+                "IMPORT_DIR": import_dir,
+                "QUOTA_CACHE_PATH": data_dir / "quota_cache.json",
+                "EVENT_LOG_PATH": data_dir / "events.jsonl",
+                "LAST_IMPORT_PATH": data_dir / "last_import_result.json",
+            }
+            with mock.patch.multiple(monitor, **patched_paths):
+                with self.assertRaisesRegex(RuntimeError, "缓存不能覆盖"):
+                    monitor.import_large_json_batch(
+                        cfg,
+                        "no-cache.json",
+                        json.dumps(cpa).encode("utf-8"),
+                        refresh_quota=False,
+                    )
+
+            self.assertEqual(len(list(auth_dir.glob("*.json"))), 1)
+            self.assertEqual(list(import_dir.glob("*/dead/*.json")), [])
+
+    def test_cleanup_quarantine_moves_instead_of_deleting_invalid_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            auth_dir = root / "auth"
+            quarantine_dir = root / "quarantine"
+            data_dir = root / "monitor_data"
+            auth_dir.mkdir()
+            source = auth_dir / "invalid.json"
+            source.write_text(json.dumps({"type": "codex", "email": "invalid@example.com"}), encoding="utf-8")
+            cfg = {
+                "auth_dir": str(auth_dir),
+                "auto_cleanup_enabled": True,
+                "auto_cleanup_interval_seconds": 3600,
+                "cleanup_quarantine_dir": str(quarantine_dir),
+                "cleanup_move_missing_tokens": True,
+                "cleanup_move_read_errors": True,
+                "cleanup_move_expired": True,
+                "cleanup_move_access_expired": False,
+                "cleanup_skip_disabled": True,
+                "cleanup_delete_quota_low": False,
+            }
+            patched_paths = {
+                "DATA_DIR": data_dir,
+                "EVENT_LOG_PATH": data_dir / "events.jsonl",
+                "CLEANUP_MANIFEST_PATH": data_dir / "cleanup_manifest.jsonl",
+            }
+            with mock.patch.multiple(monitor, **patched_paths):
+                result = monitor.cleanup_auth_pool(cfg, force=True, quota_cache=None)
+
+            self.assertEqual(result["deleted"], 0)
+            self.assertEqual(result["moved"], 1)
+            self.assertFalse(source.exists())
+            self.assertEqual(len(list(quarantine_dir.glob("missing_token/*.json"))), 1)
+
+    def test_config_parsers_handle_string_booleans_and_invalid_numbers(self) -> None:
+        self.assertFalse(monitor.config_bool("false", True))
+        self.assertTrue(monitor.config_bool("yes", False))
+        self.assertEqual(monitor.config_int("bad", 16, 1, 64), 16)
+        self.assertEqual(monitor.config_int(1000, 16, 1, 64), 64)
+        self.assertEqual(monitor.config_float("bad", 5, 0, 100), 5.0)
+
+    def test_empty_auth_dir_never_scans_current_directory(self) -> None:
+        accounts, warnings = monitor.scan_auth_accounts({"auth_dir": ""})
+        self.assertEqual(accounts, [])
+        self.assertTrue(any("auth_dir" in warning for warning in warnings))
+
+    def test_millisecond_expiration_timestamp_is_parsed(self) -> None:
+        parsed = monitor.parse_datetime(4070908800000)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.year, 2099)
+
+    def test_remote_pool_controls_are_present_in_page(self) -> None:
+        page = monitor.render_index()
+        self.assertIn("remotePoolPanel", page)
+        self.assertIn("submitSelectedRemoteAccounts", page)
+        self.assertIn("/api/remote-pool/upload", page)
 
 
 if __name__ == "__main__":

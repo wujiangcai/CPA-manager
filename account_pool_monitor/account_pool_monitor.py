@@ -64,6 +64,11 @@ DEFAULT_CONFIG = {
     "import_move_dead_from_auth_dir": True,
     "import_try_management_upload": True,
     "import_upload_concurrency": 32,
+    "import_max_bytes": 536870912,
+    "remote_pool_base_url": "",
+    "remote_pool_management_key": "",
+    "remote_pool_upload_concurrency": 16,
+    "remote_pool_timeout_seconds": 25,
 }
 
 WHAM_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
@@ -86,12 +91,14 @@ SENSITIVE_KEYS = {
     "secret",
     "password",
     "management_key",
+    "remote_pool_management_key",
 }
 
 LOG_LOCK = threading.Lock()
 QUOTA_LOCK = threading.Lock()
 CLEANUP_LOCK = threading.Lock()
 IMPORT_LOCK = threading.Lock()
+REMOTE_UPLOAD_LOCK = threading.Lock()
 CLEANUP_STATE = {"last_run": 0.0, "last_result": None}
 
 
@@ -188,6 +195,41 @@ def normalize_base_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def config_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return default
+    text = clean_string(value).lower()
+    if text in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return default
+
+
+def config_int(value: Any, default: int, minimum: int, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = int(default)
+    parsed = max(int(minimum), parsed)
+    if maximum is not None:
+        parsed = min(int(maximum), parsed)
+    return parsed
+
+
+def config_float(value: Any, default: float, minimum: float, maximum: float | None = None) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    parsed = max(float(minimum), parsed)
+    if maximum is not None:
+        parsed = min(float(maximum), parsed)
+    return parsed
+
+
 def parse_scalar_from_yaml(text: str, key: str) -> str:
     pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*:\s*(.+?)\s*$")
     match = pattern.search(text)
@@ -209,8 +251,16 @@ def load_config() -> dict[str, Any]:
     if env_key and not clean_string(cfg.get("management_key")):
         cfg["management_key"] = env_key.strip()
 
-    cpa_config_path = Path(clean_string(cfg.get("cpa_config_path")) or DEFAULT_CONFIG["cpa_config_path"])
-    if cpa_config_path.exists():
+    remote_base_url = os.environ.get("CPA_REMOTE_POOL_BASE_URL")
+    if remote_base_url:
+        cfg["remote_pool_base_url"] = remote_base_url.strip()
+    remote_key = os.environ.get("CPA_REMOTE_POOL_MANAGEMENT_KEY")
+    if remote_key:
+        cfg["remote_pool_management_key"] = remote_key.strip()
+
+    cpa_config_text = clean_string(cfg.get("cpa_config_path"))
+    cpa_config_path = Path(cpa_config_text) if cpa_config_text else None
+    if cpa_config_path is not None and cpa_config_path.is_file():
         try:
             text = cpa_config_path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
@@ -235,28 +285,33 @@ def load_config() -> dict[str, Any]:
     cfg["cpa_base_url"] = normalize_base_url(clean_string(cfg.get("cpa_base_url")))
     cfg["proxy_url"] = clean_string(cfg.get("proxy_url"))
     cfg["quota_query_mode"] = clean_string(cfg.get("quota_query_mode") or "direct_auth").lower()
-    cfg["port"] = int(cfg.get("port") or 18320)
-    cfg["quota_low_threshold_percent"] = float(cfg.get("quota_low_threshold_percent") or 5)
-    cfg["quota_query_timeout_seconds"] = int(cfg.get("quota_query_timeout_seconds") or 25)
-    cfg["quota_query_concurrency"] = max(1, min(int(cfg.get("quota_query_concurrency") or 32), 256))
-    cfg["quota_query_retries"] = max(1, min(int(cfg.get("quota_query_retries") or 3), 6))
-    cfg["quota_delete_cache_max_age_seconds"] = max(30, int(cfg.get("quota_delete_cache_max_age_seconds") or 600))
-    cfg["proxy_check_enabled"] = bool(cfg.get("proxy_check_enabled", True))
+    cfg["port"] = config_int(cfg.get("port"), 18320, 1, 65535)
+    cfg["quota_low_threshold_percent"] = config_float(cfg.get("quota_low_threshold_percent"), 5, 0, 100)
+    cfg["quota_query_timeout_seconds"] = config_int(cfg.get("quota_query_timeout_seconds"), 25, 1, 300)
+    cfg["quota_query_concurrency"] = config_int(cfg.get("quota_query_concurrency"), 32, 1, 256)
+    cfg["quota_query_retries"] = config_int(cfg.get("quota_query_retries"), 3, 1, 6)
+    cfg["quota_delete_cache_max_age_seconds"] = config_int(cfg.get("quota_delete_cache_max_age_seconds"), 600, 30)
+    cfg["proxy_check_enabled"] = config_bool(cfg.get("proxy_check_enabled"), True)
     cfg["proxy_check_url"] = clean_string(cfg.get("proxy_check_url") or "https://chatgpt.com/cdn-cgi/trace")
-    cfg["proxy_check_timeout_seconds"] = max(2, min(int(cfg.get("proxy_check_timeout_seconds") or 8), 60))
-    cfg["auto_cleanup_enabled"] = bool(cfg.get("auto_cleanup_enabled", True))
-    cfg["auto_cleanup_interval_seconds"] = max(3600, int(cfg.get("auto_cleanup_interval_seconds") or 3600))
-    cfg["cleanup_delete_quota_low"] = bool(cfg.get("cleanup_delete_quota_low", True))
+    cfg["proxy_check_timeout_seconds"] = config_int(cfg.get("proxy_check_timeout_seconds"), 8, 2, 60)
+    cfg["auto_cleanup_enabled"] = config_bool(cfg.get("auto_cleanup_enabled"), False)
+    cfg["auto_cleanup_interval_seconds"] = config_int(cfg.get("auto_cleanup_interval_seconds"), 3600, 3600)
+    cfg["cleanup_delete_quota_low"] = config_bool(cfg.get("cleanup_delete_quota_low"), False)
     cfg["cleanup_quarantine_dir"] = clean_string(cfg.get("cleanup_quarantine_dir"))
-    cfg["cleanup_move_expired"] = bool(cfg.get("cleanup_move_expired", True))
-    cfg["cleanup_move_missing_tokens"] = bool(cfg.get("cleanup_move_missing_tokens", True))
-    cfg["cleanup_move_read_errors"] = bool(cfg.get("cleanup_move_read_errors", True))
-    cfg["cleanup_move_access_expired"] = bool(cfg.get("cleanup_move_access_expired", False))
-    cfg["cleanup_skip_disabled"] = bool(cfg.get("cleanup_skip_disabled", True))
-    cfg["import_keep_alive_in_auth_dir"] = bool(cfg.get("import_keep_alive_in_auth_dir", True))
-    cfg["import_move_dead_from_auth_dir"] = bool(cfg.get("import_move_dead_from_auth_dir", True))
-    cfg["import_try_management_upload"] = bool(cfg.get("import_try_management_upload", True))
-    cfg["import_upload_concurrency"] = max(1, min(int(cfg.get("import_upload_concurrency") or 32), 256))
+    cfg["cleanup_move_expired"] = config_bool(cfg.get("cleanup_move_expired"), True)
+    cfg["cleanup_move_missing_tokens"] = config_bool(cfg.get("cleanup_move_missing_tokens"), True)
+    cfg["cleanup_move_read_errors"] = config_bool(cfg.get("cleanup_move_read_errors"), True)
+    cfg["cleanup_move_access_expired"] = config_bool(cfg.get("cleanup_move_access_expired"), False)
+    cfg["cleanup_skip_disabled"] = config_bool(cfg.get("cleanup_skip_disabled"), True)
+    cfg["import_keep_alive_in_auth_dir"] = config_bool(cfg.get("import_keep_alive_in_auth_dir"), True)
+    cfg["import_move_dead_from_auth_dir"] = config_bool(cfg.get("import_move_dead_from_auth_dir"), True)
+    cfg["import_try_management_upload"] = config_bool(cfg.get("import_try_management_upload"), True)
+    cfg["import_upload_concurrency"] = config_int(cfg.get("import_upload_concurrency"), 32, 1, 256)
+    cfg["import_max_bytes"] = config_int(cfg.get("import_max_bytes"), 536870912, 1048576, 2147483648)
+    cfg["remote_pool_base_url"] = clean_string(cfg.get("remote_pool_base_url")).rstrip("/")
+    cfg["remote_pool_management_key"] = clean_string(cfg.get("remote_pool_management_key"))
+    cfg["remote_pool_upload_concurrency"] = config_int(cfg.get("remote_pool_upload_concurrency"), 16, 1, 64)
+    cfg["remote_pool_timeout_seconds"] = config_int(cfg.get("remote_pool_timeout_seconds"), 25, 2, 300)
     return cfg
 
 
@@ -276,7 +331,10 @@ def parse_datetime(value: Any) -> dt.datetime | None:
         if value <= 0:
             return None
         try:
-            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc).astimezone()
+            timestamp = float(value)
+            if timestamp > 100_000_000_000:
+                timestamp /= 1000.0
+            return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).astimezone()
         except Exception:
             return None
     raw = clean_string(value)
@@ -471,7 +529,10 @@ def boolish(value: Any) -> bool:
 
 
 def scan_auth_accounts(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
-    auth_dir = Path(clean_string(cfg.get("auth_dir")))
+    auth_dir_text = clean_string(cfg.get("auth_dir"))
+    if not auth_dir_text:
+        return [], ["尚未配置号池目录 auth_dir"]
+    auth_dir = Path(auth_dir_text)
     warnings: list[str] = []
     if not auth_dir.exists():
         return [], [f"号池目录不存在: {auth_dir}"]
@@ -644,7 +705,7 @@ def cleanup_reason_for_account(account: dict[str, Any], cfg: dict[str, Any]) -> 
     if isinstance(quota, dict) and quota_cache_is_fresh(account.get("_quota_cache"), cfg):
         quota_status = clean_string(quota.get("status"))
         if quota_status == "low":
-            return "quota_low" if cfg.get("cleanup_delete_quota_low", True) else ""
+            return "quota_low" if cfg.get("cleanup_delete_quota_low", False) else ""
         if quota_status == "exhausted":
             return "quota_exhausted"
         if quota_status == "missing":
@@ -661,6 +722,25 @@ def cleanup_reason_for_account(account: dict[str, Any], cfg: dict[str, Any]) -> 
     if status == "token_expired" and cfg.get("cleanup_move_access_expired", False):
         return "access_expired"
     return ""
+
+
+def cleanup_file_action(file_path: Path, cfg: dict[str, Any], reason: str) -> tuple[str, str]:
+    quarantine_text = clean_string(cfg.get("cleanup_quarantine_dir"))
+    if not quarantine_text:
+        file_path.unlink()
+        return "deleted", ""
+
+    quarantine_root = Path(quarantine_text)
+    if not quarantine_root.is_absolute():
+        quarantine_root = APP_DIR / quarantine_root
+    destination_dir = quarantine_root / safe_filename_part(reason, "unknown", 48)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / file_path.name
+    if destination.exists():
+        suffix = now_local().strftime("%Y%m%d_%H%M%S_%f") + "_" + short_hash(str(file_path) + str(time.time_ns()))
+        destination = destination_dir / f"{file_path.stem}_{suffix}{file_path.suffix}"
+    shutil.move(str(file_path), str(destination))
+    return "moved", str(destination)
 
 
 def append_cleanup_manifest(row: dict[str, Any]) -> None:
@@ -752,7 +832,7 @@ def cleanup_stats(hours: int = CLEANUP_DISPLAY_HOURS) -> dict[str, Any]:
 
 
 def cleanup_auth_pool(cfg: dict[str, Any], force: bool = False, quota_cache: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not force and not cfg.get("auto_cleanup_enabled", True):
+    if not force and not cfg.get("auto_cleanup_enabled", False):
         return {"enabled": False, "deleted": 0, "moved": 0, "skipped": 0, "errors": 0, "items": [], "ran_at": ""}
     now_ts = time.time()
     interval = max(3600, int(cfg.get("auto_cleanup_interval_seconds") or 3600))
@@ -790,13 +870,14 @@ def cleanup_auth_pool(cfg: dict[str, Any], force: bool = False, quota_cache: dic
                 if not file_path.exists():
                     result["skipped"] += 1
                     continue
-                file_path.unlink()
+                action, destination = cleanup_file_action(file_path, cfg, reason)
                 row = {
                     "time": isoformat_local(),
                     "reason": reason,
                     "file": file_path.name,
                     "from": str(file_path),
-                    "action": "deleted",
+                    "action": action,
+                    "to": destination,
                     "email": account.get("email"),
                     "status": account.get("status"),
                     "quota_status": account.get("quota", {}).get("status") if isinstance(account.get("quota"), dict) else "",
@@ -806,7 +887,10 @@ def cleanup_auth_pool(cfg: dict[str, Any], force: bool = False, quota_cache: dic
                 append_cleanup_manifest(row)
                 log_event("warn", "已自动删除失效 CPA 账号", row)
                 result["items"].append(row)
-                result["deleted"] += 1
+                if action == "moved":
+                    result["moved"] += 1
+                else:
+                    result["deleted"] += 1
             except Exception as exc:
                 result["errors"] += 1
                 row = {"file": file_path.name, "reason": reason, "error": str(exc)}
@@ -831,7 +915,7 @@ def delete_accounts_by_plan(cfg: dict[str, Any], plan: str, refresh_quota: bool 
                 cache = query_quota_reports(cfg)
         except Exception as exc:
             warnings.append("quota refresh failed, using current cache: " + safe_short(str(exc), 180))
-            log_event("error", "鎵嬪姩鎵归噺鍒犻櫎鍓嶆煡璇㈤搴﹀け璐?", {"plan": target_plan, "error": str(exc)})
+            log_event("error", "手动批量删除前查询额度失败", {"plan": target_plan, "error": str(exc)})
 
     accounts, scan_warnings = scan_auth_accounts(cfg)
     warnings.extend(scan_warnings)
@@ -879,14 +963,14 @@ def delete_accounts_by_plan(cfg: dict[str, Any], plan: str, refresh_quota: bool 
                     "disabled": account.get("disabled"),
                 }
                 append_cleanup_manifest(row)
-                log_event("warn", "鎵嬪姩鎵归噺鍒犻櫎 CPA 璐﹀彿", row)
+                log_event("warn", "手动批量删除 CPA 账号", row)
                 result["items"].append(row)
                 result["deleted"] += 1
             except Exception as exc:
                 result["errors"] += 1
                 row = {"file": file_path.name, "plan": target_plan, "reason": "manual_plan_" + target_plan, "error": str(exc)}
                 result["items"].append(row)
-                log_event("error", "鎵嬪姩鎵归噺鍒犻櫎 CPA 璐﹀彿澶辫触", row)
+                log_event("error", "手动批量删除 CPA 账号失败", row)
     return result
 
 
@@ -895,7 +979,7 @@ def cleanup_worker() -> None:
         try:
             cfg = load_config()
             interval = max(3600, int(cfg.get("auto_cleanup_interval_seconds") or 3600))
-            if not cfg.get("auto_cleanup_enabled", True):
+            if not cfg.get("auto_cleanup_enabled", False):
                 time.sleep(60)
                 continue
             cache = None
@@ -2268,6 +2352,11 @@ def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, r
         warnings.extend(scan_warnings)
         by_file = {clean_string(account.get("file")).lower(): account for account in accounts}
         target_accounts = [by_file[name.lower()] for name in imported_names if name.lower() in by_file]
+        if not refresh_quota and imported_names and not quota_cache_is_usable(cache, cfg, target_accounts):
+            warning = "未刷新额度且现有缓存不能覆盖本批账号，已停止归档和删除，避免误判死亡账号"
+            warnings.append(warning)
+            log_event("warn", "导入账号缺少可用额度缓存", {"batch_id": batch_id, "imported": len(imported_names)})
+            raise RuntimeError(warning)
         target_accounts = merge_quota(target_accounts, cache)
         by_file = {clean_string(account.get("file")).lower(): account for account in target_accounts}
         threshold = float(cfg.get("quota_low_threshold_percent") or 5)
@@ -2334,6 +2423,165 @@ def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, r
     return result
 
 
+def validate_remote_pool_config(cfg: dict[str, Any]) -> tuple[str, str]:
+    base_url = clean_string(cfg.get("remote_pool_base_url")).rstrip("/")
+    management_key = clean_string(cfg.get("remote_pool_management_key"))
+    if not base_url:
+        raise RuntimeError("请先在 monitor_config.json 配置 remote_pool_base_url")
+    parsed = urllib.parse.urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise RuntimeError("remote_pool_base_url 必须是有效的 http:// 或 https:// 地址")
+    if not management_key:
+        raise RuntimeError("请配置 remote_pool_management_key，或设置 CPA_REMOTE_POOL_MANAGEMENT_KEY 环境变量")
+    return base_url, management_key
+
+
+def upload_one_remote_pool_account(cfg: dict[str, Any], name: str, account: dict[str, Any]) -> dict[str, Any]:
+    base_url, management_key = validate_remote_pool_config(cfg)
+    url = base_url + "/v0/management/auth-files?name=" + urllib.parse.quote(name)
+    data = json.dumps(account, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": "Bearer " + management_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=int(cfg.get("remote_pool_timeout_seconds") or 25)) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            body = response.read(4096)
+    except urllib.error.HTTPError as exc:
+        body = exc.read(4096).decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code}: {safe_short(body, 220)}") from exc
+    except Exception as exc:
+        raise RuntimeError(safe_short(str(exc), 220)) from exc
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"HTTP {status}: {safe_short(body.decode('utf-8', errors='replace'), 220)}")
+    return {"status": status, "bytes": len(data)}
+
+
+def resolve_alive_import_file(batch_id: str, file_name: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", batch_id):
+        raise ValueError("invalid batch_id")
+    if not file_name or file_name != Path(file_name).name or not file_name.lower().endswith(".json"):
+        raise ValueError("invalid account file name")
+    alive_dir = (IMPORT_DIR / batch_id / "alive").resolve()
+    file_path = (alive_dir / file_name).resolve()
+    if file_path.parent != alive_dir or not file_path.exists() or not file_path.is_file():
+        raise FileNotFoundError("alive account file not found: " + file_name)
+    return file_path
+
+
+def submit_alive_accounts_to_remote_pool(cfg: dict[str, Any], batch_id: str, file_names: list[str]) -> dict[str, Any]:
+    base_url, _management_key = validate_remote_pool_config(cfg)
+    latest = read_last_import_result()
+    if not isinstance(latest, dict) or clean_string(latest.get("batch_id")) != batch_id:
+        raise ValueError("只能提交最近一次验活批次中的账号，请刷新页面后重试")
+    latest_items = latest.get("items")
+    if not isinstance(latest_items, list):
+        raise ValueError("最近批次缺少账号明细")
+
+    alive_items: dict[str, dict[str, Any]] = {}
+    for item in latest_items:
+        if not isinstance(item, dict) or item.get("alive") is not True:
+            continue
+        name = clean_string(item.get("file"))
+        if name:
+            alive_items[name] = item
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in file_names:
+        name = clean_string(value)
+        if name and name not in seen:
+            seen.add(name)
+            selected.append(name)
+    if not selected:
+        raise ValueError("请至少选择一个存活账号")
+    if len(selected) > 10000:
+        raise ValueError("单次最多提交 10000 个账号")
+    invalid = [name for name in selected if name not in alive_items]
+    if invalid:
+        raise ValueError("只能提交已通过验活的账号: " + ", ".join(invalid[:5]))
+
+    jobs: list[tuple[int, str, dict[str, Any]]] = []
+    for index, name in enumerate(selected):
+        file_path = resolve_alive_import_file(batch_id, name)
+        raw = json.loads(file_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(raw, dict):
+            raise ValueError(name + " 不是有效的账号 JSON")
+        if clean_string(raw.get("type")).lower() != "codex" or not clean_string(raw.get("access_token")):
+            raise ValueError(name + " 不是可上传的 CPA Codex auth")
+        jobs.append((index, name, raw))
+
+    result = {
+        "ok": True,
+        "ran_at": isoformat_local(),
+        "batch_id": batch_id,
+        "remote_pool_base_url": base_url,
+        "requested": len(jobs),
+        "uploaded": 0,
+        "failed": 0,
+        "concurrency": int(cfg.get("remote_pool_upload_concurrency") or 16),
+        "items": [],
+    }
+
+    def worker(job: tuple[int, str, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+        index, name, account = job
+        source_item = alive_items[name]
+        row = {
+            "file": name,
+            "email": clean_string(source_item.get("email")),
+            "name": clean_string(source_item.get("name")),
+            "ok": False,
+            "status": 0,
+            "error": "",
+        }
+        try:
+            response = upload_one_remote_pool_account(cfg, name, account)
+            row["ok"] = True
+            row["status"] = int(response.get("status") or 200)
+        except Exception as exc:
+            row["error"] = safe_short(str(exc), 220)
+        return index, row
+
+    workers = max(1, min(int(cfg.get("remote_pool_upload_concurrency") or 16), 64, len(jobs)))
+    rows_with_index: list[tuple[int, dict[str, Any]]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(worker, job) for job in jobs]
+        for future in concurrent.futures.as_completed(futures):
+            rows_with_index.append(future.result())
+    rows_with_index.sort(key=lambda value: value[0])
+    result["items"] = [row for _index, row in rows_with_index]
+    result["uploaded"] = sum(1 for row in result["items"] if row.get("ok"))
+    result["failed"] = len(result["items"]) - result["uploaded"]
+    result["ok"] = result["failed"] == 0
+
+    row_updates = {clean_string(row.get("file")): row for row in result["items"]}
+    for item in latest_items:
+        if not isinstance(item, dict):
+            continue
+        update = row_updates.get(clean_string(item.get("file")))
+        if not update:
+            continue
+        item["remote_uploaded"] = bool(update.get("ok"))
+        item["remote_uploaded_at"] = result["ran_at"] if update.get("ok") else ""
+        item["remote_upload_error"] = clean_string(update.get("error"))
+        item["remote_pool_base_url"] = base_url
+    latest["remote_upload"] = sanitize_for_output(result)
+    write_json(LAST_IMPORT_PATH, sanitize_for_output(latest))
+    log_event(
+        "info" if result["ok"] else "warn",
+        "已提交验活账号到远端号池",
+        {"batch_id": batch_id, "requested": result["requested"], "uploaded": result["uploaded"], "failed": result["failed"], "remote": base_url},
+    )
+    return result
+
+
 def build_summary(accounts: list[dict[str, Any]], cache: dict[str, Any] | None) -> dict[str, Any]:
     total = len(accounts)
     disabled = sum(1 for item in accounts if item.get("disabled"))
@@ -2392,12 +2640,17 @@ def public_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "proxy_check_timeout_seconds": cfg.get("proxy_check_timeout_seconds"),
         "auto_cleanup_enabled": bool(cfg.get("auto_cleanup_enabled")),
         "auto_cleanup_interval_seconds": cfg.get("auto_cleanup_interval_seconds"),
-        "cleanup_delete_quota_low": bool(cfg.get("cleanup_delete_quota_low", True)),
+        "cleanup_delete_quota_low": bool(cfg.get("cleanup_delete_quota_low", False)),
         "cleanup_quarantine_dir": cfg.get("cleanup_quarantine_dir"),
         "import_keep_alive_in_auth_dir": bool(cfg.get("import_keep_alive_in_auth_dir", True)),
         "import_move_dead_from_auth_dir": bool(cfg.get("import_move_dead_from_auth_dir", True)),
         "import_try_management_upload": bool(cfg.get("import_try_management_upload", True)),
         "import_upload_concurrency": cfg.get("import_upload_concurrency"),
+        "import_max_bytes": cfg.get("import_max_bytes"),
+        "remote_pool_base_url": cfg.get("remote_pool_base_url"),
+        "remote_pool_management_key_configured": bool(clean_string(cfg.get("remote_pool_management_key"))),
+        "remote_pool_configured": bool(clean_string(cfg.get("remote_pool_base_url")) and clean_string(cfg.get("remote_pool_management_key"))),
+        "remote_pool_upload_concurrency": cfg.get("remote_pool_upload_concurrency"),
     }
 
 
@@ -2690,6 +2943,38 @@ def render_index() -> str:
       line-height: 1.6;
       word-break: break-all;
     }
+    .remote-pool-panel {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+    }
+    .remote-pool-head, .remote-pool-tools {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .remote-pool-head h3 { margin: 0; font-size: 15px; }
+    .remote-pool-tools { justify-content: flex-start; margin: 9px 0; }
+    .remote-account-list {
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfbf9;
+    }
+    .remote-account-row {
+      display: grid;
+      grid-template-columns: auto minmax(160px, 1fr) minmax(120px, .7fr) auto;
+      gap: 8px;
+      align-items: center;
+      padding: 7px 9px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .remote-account-row:last-child { border-bottom: 0; }
+    .remote-account-row input { margin: 0; }
     .cleanup-log {
       background: var(--panel);
       border: 1px solid var(--line);
@@ -2802,6 +3087,8 @@ def render_index() -> str:
       .tools { width: 100%; }
       .search { width: 100%; }
       .import-grid { grid-template-columns: 1fr; }
+      .remote-account-row { grid-template-columns: auto minmax(0, 1fr); }
+      .remote-account-row .remote-file, .remote-account-row .remote-state { grid-column: 2; }
       th, td { padding: 8px; }
     }
   </style>
@@ -2833,6 +3120,7 @@ def render_index() -> str:
         <button class="primary" id="importBatchBtn">选择文件并开始检测</button>
       </div>
       <div class="import-result" id="importResult"></div>
+      <div class="remote-pool-panel" id="remotePoolPanel"></div>
     </section>
     <section id="cleanupLogSection"></section>
     <div class="split">
@@ -2887,6 +3175,9 @@ def render_index() -> str:
     const $ = (id) => document.getElementById(id);
     let state = null;
     let cleanupLogExpanded = false;
+    let remoteSelectionBatch = '';
+    let remoteSelectedFiles = new Set();
+    let remoteUploadInProgress = false;
 
     function h(value) {
       return String(value ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
@@ -2984,6 +3275,117 @@ def render_index() -> str:
         `<br>死亡目录：<span class="mono">${h(result.dead_dir || '-')}</span>${download}`
       ].filter(Boolean).join(' · ');
     }
+    function renderRemotePool(result, cfg) {
+      const target = $('remotePoolPanel');
+      if (!target) return;
+      const items = result && Array.isArray(result.items) ? result.items.filter(item => item && item.alive === true) : [];
+      if (!result || !items.length) {
+        remoteSelectionBatch = result && result.batch_id ? String(result.batch_id) : '';
+        remoteSelectedFiles = new Set();
+        target.innerHTML = '<span class="muted">验活完成后，可在这里勾选存活账号提交到远端 CPA 号池。</span>';
+        return;
+      }
+      const batchId = String(result.batch_id || '');
+      const aliveFiles = new Set(items.map(item => String(item.file || '')).filter(Boolean));
+      if (remoteSelectionBatch !== batchId) {
+        remoteSelectionBatch = batchId;
+        remoteSelectedFiles = new Set(items.filter(item => !item.remote_uploaded).map(item => String(item.file || '')).filter(Boolean));
+      } else {
+        remoteSelectedFiles = new Set([...remoteSelectedFiles].filter(name => aliveFiles.has(name)));
+      }
+      const configured = Boolean(cfg && cfg.remote_pool_configured);
+      const remoteUrl = cfg && cfg.remote_pool_base_url ? String(cfg.remote_pool_base_url) : '';
+      const previous = result.remote_upload || {};
+      const previousText = previous.ran_at
+        ? `上次提交：成功 ${h(previous.uploaded || 0)} / 失败 ${h(previous.failed || 0)} · ${h(fmtDate(previous.ran_at))}`
+        : '尚未提交到远端号池';
+      target.innerHTML = `
+        <div class="remote-pool-head">
+          <h3>选择存活账号提交远端号池</h3>
+          <span class="pill ${configured ? 'good' : 'warn'}">${configured ? `远端 ${h(remoteUrl)}` : '远端号池未配置'}</span>
+        </div>
+        <div class="muted">${previousText}${configured ? '' : '；请先配置 remote_pool_base_url 和 remote_pool_management_key'}</div>
+        <div class="remote-pool-tools">
+          <button type="button" id="remoteSelectAllBtn">全选存活</button>
+          <button type="button" id="remoteSelectNoneBtn">取消全选</button>
+          <button type="button" class="primary" id="remoteSubmitBtn"></button>
+        </div>
+        <div class="remote-account-list">
+          ${items.map(item => {
+            const file = String(item.file || '');
+            const checked = remoteSelectedFiles.has(file) ? ' checked' : '';
+            const status = item.remote_uploaded
+              ? `<span class="pill good">已上传 ${h(fmtDate(item.remote_uploaded_at))}</span>`
+              : (item.remote_upload_error ? `<span class="pill bad" title="${h(item.remote_upload_error)}">上传失败</span>` : '<span class="pill warn">待提交</span>');
+            return `<label class="remote-account-row">
+              <input type="checkbox" class="remote-account-check" value="${h(file)}"${checked}>
+              <span>${h(item.email || item.name || '(无邮箱)')}</span>
+              <span class="remote-file mono">${h(file)}</span>
+              <span class="remote-state">${status}</span>
+            </label>`;
+          }).join('')}
+        </div>`;
+
+      const submitBtn = $('remoteSubmitBtn');
+      const updateSubmitButton = () => {
+        const count = remoteSelectedFiles.size;
+        submitBtn.textContent = remoteUploadInProgress ? '提交中...' : `提交选中账号 (${count})`;
+        submitBtn.disabled = remoteUploadInProgress || !configured || count === 0;
+      };
+      target.querySelectorAll('.remote-account-check').forEach(input => {
+        input.addEventListener('change', () => {
+          if (input.checked) remoteSelectedFiles.add(input.value);
+          else remoteSelectedFiles.delete(input.value);
+          updateSubmitButton();
+        });
+      });
+      $('remoteSelectAllBtn').addEventListener('click', () => {
+        remoteSelectedFiles = new Set(aliveFiles);
+        target.querySelectorAll('.remote-account-check').forEach(input => { input.checked = true; });
+        updateSubmitButton();
+      });
+      $('remoteSelectNoneBtn').addEventListener('click', () => {
+        remoteSelectedFiles = new Set();
+        target.querySelectorAll('.remote-account-check').forEach(input => { input.checked = false; });
+        updateSubmitButton();
+      });
+      submitBtn.addEventListener('click', submitSelectedRemoteAccounts);
+      updateSubmitButton();
+    }
+    async function submitSelectedRemoteAccounts() {
+      if (remoteUploadInProgress) return;
+      const files = [...remoteSelectedFiles];
+      const cfg = state && state.config ? state.config : {};
+      if (!files.length || !remoteSelectionBatch) return;
+      if (!confirm(`提交选中的 ${files.length} 个存活账号到远端号池？\n\n远端：${cfg.remote_pool_base_url || '-'}`)) return;
+      remoteUploadInProgress = true;
+      const btn = $('remoteSubmitBtn');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '提交中...';
+      }
+      try {
+        const response = await fetch('/api/remote-pool/upload', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({batch_id: remoteSelectionBatch, files}),
+          cache: 'no-store'
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+        const upload = data.remote_upload || {};
+        for (const item of (upload.items || [])) {
+          if (item && item.ok) remoteSelectedFiles.delete(String(item.file || ''));
+        }
+        render(data);
+        alert(`远端号池提交完成：成功 ${upload.uploaded ?? 0} 个，失败 ${upload.failed ?? 0} 个。`);
+      } catch (err) {
+        alert('提交远端号池失败：' + err);
+      } finally {
+        remoteUploadInProgress = false;
+        if (state) renderRemotePool(state.import || state.last_import || null, state.config || {});
+      }
+    }
     function render(data) {
       state = data;
       const cfg = data.config || {};
@@ -3012,8 +3414,9 @@ def render_index() -> str:
       const cleanupRecentText = cleanupStats.recent ? ' / \u8fd1' + h(cleanupStats.hours || 12) + '\u5c0f\u65f6 ' + h(cleanupStats.recent) : '';
       const cleanupIntervalText = cfg.auto_cleanup_interval_seconds ? ' \u00b7 \u6bcf' + h(fmtInterval(cfg.auto_cleanup_interval_seconds)) + '\u81ea\u52a8\u67e5\u4e00\u6b21' : '';
       const cleanupStatusText = '\u81ea\u52a8\u6e05\u7406 ' + (cfg.auto_cleanup_enabled ? '\u5df2\u542f\u7528' : '\u672a\u542f\u7528') + cleanupIntervalText + ' \u00b7 \u81ea\u52a8\u5220\u9664 ' + h(cleanupTotal) + ' \u4e2a' + cleanupRecentText;
+      const quotaThreshold = Number(cfg.quota_low_threshold_percent ?? 5);
       $('autoCleanupBtn').textContent = cfg.auto_cleanup_enabled ? '\u5173\u95ed\u81ea\u52a8\u5220\u9664' : '\u5f00\u542f\u81ea\u52a8\u5220\u9664\u4e00\u5c0f\u65f6';
-      $('lowQuotaDeleteBtn').textContent = cfg.cleanup_delete_quota_low ? '\u5173\u95ed\u4f4e\u4e8e5%\u5220\u9664' : '\u5f00\u542f\u4f4e\u4e8e5%\u5220\u9664';
+      $('lowQuotaDeleteBtn').textContent = cfg.cleanup_delete_quota_low ? `关闭低于${quotaThreshold}%删除` : `开启低于${quotaThreshold}%删除`;
       $('statusLine').innerHTML = [
         `<span class="pill good">页面 ${h(data.generated_at || '-')}</span>`,
         `<span class="pill good">额度模式 ${h(cfg.quota_query_mode || 'direct_auth')}</span>`,
@@ -3021,14 +3424,16 @@ def render_index() -> str:
         `<span class="pill ${cfg.proxy_check_enabled ? 'good' : 'warn'}">代理预检 ${cfg.proxy_check_enabled ? '开启' : '关闭'}</span>`,
         `<span class="pill good">检测并发 ${h(cfg.quota_query_concurrency || 32)}</span>`,
         `<span class="pill good">导入并发 ${h(cfg.import_upload_concurrency || 32)}</span>`,
+        `<span class="pill ${cfg.remote_pool_configured ? 'good' : 'warn'}">远端号池 ${cfg.remote_pool_configured ? '已配置' : '未配置'}</span>`,
         `<span class="pill">低额度阈值 ${h(cfg.quota_low_threshold_percent)}%</span>`,
         `<span class="pill ${cfg.auto_cleanup_enabled ? 'good' : 'warn'}">${cleanupStatusText}</span>`,
-        `<span class="pill ${cfg.cleanup_delete_quota_low ? 'good' : 'warn'}">\u4f4e\u4e8e5%\u5220\u9664 ${cfg.cleanup_delete_quota_low ? '\u5df2\u542f\u7528' : '\u5df2\u5173\u95ed'}</span>`,
+        `<span class="pill ${cfg.cleanup_delete_quota_low ? 'good' : 'warn'}">低于${h(quotaThreshold)}%删除 ${cfg.cleanup_delete_quota_low ? '已启用' : '已关闭'}</span>`,
         s.quota_cache_created_at ? `<span class="pill">额度缓存 ${h(fmtDate(s.quota_cache_created_at))}</span>` : ''
       ].filter(Boolean).join('');
       renderProblems(data.accounts || []);
       renderCleanupLog(cleanupRecent, data.cleanup_recent_hours || 12);
       renderImportResult(data.import || data.last_import || null);
+      renderRemotePool(data.import || data.last_import || null, cfg);
       renderAccounts(data.accounts || []);
       renderLogs(data.events || []);
     }
@@ -3074,26 +3479,6 @@ def render_index() -> str:
           if (toggleText) toggleText.textContent = details.open ? '\u6536\u8d77\u660e\u7ec6' : '\u5c55\u5f00\u660e\u7ec6';
         });
       }
-      return;
-      target.innerHTML = `
-        <div class="section-head">
-          <h2>自动删除日志</h2>
-          <div class="muted">显示最近 ${h(hours)} 小时，之后自动隐藏</div>
-        </div>
-        <div class="cleanup-log table-wrap">
-          <table>
-            <thead><tr><th>删除时间</th><th>账号</th><th>原因</th><th>额度状态</th><th>JSON 文件</th></tr></thead>
-            <tbody>${items.map(item => `
-              <tr>
-                <td>${h(fmtDate(item.time))}</td>
-                <td>${h(item.email || item.name || '-')}</td>
-                <td><span class="reason">${h(cleanupReasonLabel(item.reason))}</span></td>
-                <td>${h(statusLabel(item.quota_status || item.status || 'unknown'))}${item.quota_error ? `<div class="muted">${h(item.quota_error)}</div>` : ''}</td>
-                <td class="mono">${h(item.file || item.from || '-')}</td>
-              </tr>
-            `).join('')}</tbody>
-          </table>
-        </div>`;
     }
     function renderProblems(accounts) {
       const rows = accounts.filter(a => a.status !== 'ok' || (a.quota && ['low','exhausted','error','missing'].includes(a.quota.status)));
@@ -3146,7 +3531,7 @@ def render_index() -> str:
       $('quotaBtn').disabled = true;
       $('quotaBtn').textContent = '查询中...';
       try {
-        const res = await fetch('/api/quota?refresh=1', {cache:'no-store'});
+        const res = await fetch('/api/quota?refresh=1', {method:'POST', cache:'no-store'});
         const data = await res.json();
         render(data);
       } finally {
@@ -3158,7 +3543,7 @@ def render_index() -> str:
       $('cleanupBtn').disabled = true;
       $('cleanupBtn').textContent = '清理中...';
       try {
-        const res = await fetch('/api/cleanup?force=1', {cache:'no-store'});
+        const res = await fetch('/api/cleanup?force=1', {method:'POST', cache:'no-store'});
         const data = await res.json();
         render(data);
       } finally {
@@ -3195,6 +3580,11 @@ def render_index() -> str:
         alert('请先选择一个 JSON / JSONL 文件');
         return;
       }
+      const maxBytes = Number(state && state.config && state.config.import_max_bytes || 536870912);
+      if (file.size > maxBytes) {
+        alert(`文件过大：${file.size} 字节，当前上限为 ${maxBytes} 字节。`);
+        return;
+      }
       if (!confirm(`开始导入并检测 ${file.name}？\n\n系统会拆分为单账号 JSON，上传到 CPA，然后把存活账号复制到 alive 文件夹，把死亡账号归档到 dead 文件夹。`)) return;
       btn.disabled = true;
       btn.textContent = '导入检测中...';
@@ -3226,8 +3616,10 @@ def render_index() -> str:
     async function toggleAutoCleanup() {
       const cfg = state && state.config ? state.config : {};
       const nextEnabled = !cfg.auto_cleanup_enabled;
+      const threshold = Number(cfg.quota_low_threshold_percent ?? 5);
+      const lowText = cfg.cleanup_delete_quota_low ? `、低于${threshold}%` : '';
       const message = nextEnabled
-        ? '\u5f00\u542f\u81ea\u52a8\u5220\u9664\uff1f\u5f00\u542f\u540e\u6bcf1\u5c0f\u65f6\u81ea\u52a8\u67e5\u989d\u5ea6\uff0c\u5e76\u5220\u9664 401\u3001\u6ca1\u989d\u5ea6\u3001\u4f4e\u4e8e5% \u7684\u8d26\u53f7\u3002'
+        ? `开启自动删除？开启后每1小时自动查额度，并删除 401、无额度${lowText} 的账号。`
         : '\u5173\u95ed\u81ea\u52a8\u5220\u9664\uff1f\u5173\u95ed\u540e\u4e0d\u4f1a\u81ea\u52a8\u5220\u53f7\uff0c\u4f46\u624b\u52a8\u201c\u7acb\u5373\u6e05\u7406\u201d\u8fd8\u80fd\u7528\u3002';
       if (!confirm(message)) return;
       const btn = $('autoCleanupBtn');
@@ -3245,9 +3637,10 @@ def render_index() -> str:
     async function toggleLowQuotaDelete() {
       const cfg = state && state.config ? state.config : {};
       const nextEnabled = !cfg.cleanup_delete_quota_low;
+      const threshold = Number(cfg.quota_low_threshold_percent ?? 5);
       const message = nextEnabled
-        ? '\u5f00\u542f\u4f4e\u989d\u5220\u9664\uff1f\u5f00\u542f\u540e\uff0c\u4f4e\u4e8e5% \u7684\u8d26\u53f7\u4f1a\u5728\u81ea\u52a8\u6e05\u7406\u548c\u7acb\u5373\u6e05\u7406\u65f6\u88ab\u5220\u9664\u3002'
-        : '\u5173\u95ed\u4f4e\u989d\u5220\u9664\uff1f\u5173\u95ed\u540e\uff0c\u4f4e\u4e8e5% \u7684\u8d26\u53f7\u53ea\u4f1a\u663e\u793a\u4e3a\u4f4e\u989d\u5ea6\uff0c\u4e0d\u4f1a\u88ab\u81ea\u52a8\u6216\u7acb\u5373\u6e05\u7406\u5220\u9664\u3002';
+        ? `开启低额删除？开启后，低于${threshold}% 的账号会在自动清理和立即清理时被删除。`
+        : `关闭低额删除？关闭后，低于${threshold}% 的账号只显示为低额度，不会被自动或立即清理删除。`;
       if (!confirm(message)) return;
       const btn = $('lowQuotaDeleteBtn');
       btn.disabled = true;
@@ -3388,6 +3781,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/import-batch":
             self.handle_import_batch(parsed)
             return
+        if parsed.path == "/api/remote-pool/upload":
+            self.handle_remote_pool_upload()
+            return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
     def handle_export_available(self, parsed: urllib.parse.ParseResult) -> None:
@@ -3470,19 +3866,27 @@ class Handler(BaseHTTPRequestHandler):
         file_name = clean_string((query.get("filename") or query.get("name") or ["accounts.json"])[-1]) or "accounts.json"
         file_name = Path(file_name).name or "accounts.json"
         refresh = (query.get("refresh") or ["1"])[-1] not in {"0", "false", "no", "off"}
+        cfg = load_config()
         try:
             length = int(self.headers.get("Content-Length") or "0")
         except ValueError:
-            length = 0
+            self.send_json({"ok": False, "error": "invalid Content-Length"}, 400)
+            return
         if length <= 0:
             self.send_json({"ok": False, "error": "empty upload"}, 400)
+            return
+        max_bytes = int(cfg.get("import_max_bytes") or 536870912)
+        if length > max_bytes:
+            self.send_json({"ok": False, "error": f"upload too large; maximum is {max_bytes} bytes"}, 413)
             return
         try:
             raw = self.rfile.read(length)
         except Exception as exc:
             self.send_json({"ok": False, "error": "read upload failed: " + str(exc)}, 400)
             return
-        cfg = load_config()
+        if len(raw) != length:
+            self.send_json({"ok": False, "error": "incomplete upload body"}, 400)
+            return
         try:
             with IMPORT_LOCK:
                 result = import_large_json_batch(cfg, file_name, raw, refresh_quota=refresh)
@@ -3495,6 +3899,45 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = build_status_payload()
         payload["import"] = sanitize_for_output(result)
+        self.send_json(payload)
+
+    def handle_remote_pool_upload(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self.send_json({"ok": False, "error": "invalid Content-Length"}, 400)
+            return
+        if length <= 0 or length > 1048576:
+            self.send_json({"ok": False, "error": "invalid request body size"}, 400)
+            return
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            self.send_json({"ok": False, "error": "incomplete request body"}, 400)
+            return
+        try:
+            body = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self.send_json({"ok": False, "error": "request body must be valid JSON"}, 400)
+            return
+        if not isinstance(body, dict) or not isinstance(body.get("files"), list):
+            self.send_json({"ok": False, "error": "batch_id and files are required"}, 400)
+            return
+        batch_id = clean_string(body.get("batch_id"))
+        files = [clean_string(value) for value in body.get("files") if isinstance(value, str)]
+        cfg = load_config()
+        try:
+            with IMPORT_LOCK:
+                with REMOTE_UPLOAD_LOCK:
+                    result = submit_alive_accounts_to_remote_pool(cfg, batch_id, files)
+        except (ValueError, FileNotFoundError) as exc:
+            self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        except Exception as exc:
+            log_event("error", "提交验活账号到远端号池失败", {"batch_id": batch_id, "error": str(exc)})
+            self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+        payload = build_status_payload()
+        payload["remote_upload"] = sanitize_for_output(result)
         self.send_json(payload)
 
     def handle_quota(self) -> None:
@@ -3587,7 +4030,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = delete_accounts_by_plan(cfg, plan, refresh_quota=refresh)
         except Exception as exc:
-            log_event("error", "鎵嬪姩鎵归噺鍒犻櫎 Team 澶辫触", {"error": str(exc)})
+            log_event("error", "手动批量删除 Team 失败", {"error": str(exc)})
             payload = build_status_payload()
             payload["ok"] = False
             payload["delete_plan_error"] = str(exc)

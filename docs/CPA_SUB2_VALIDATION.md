@@ -13,6 +13,8 @@
 
 页面会显示识别数量、CPA/Sub2 格式统计、上传数量、存活数量、死亡数量以及归档下载地址。
 
+验活完成后，页面下方会显示存活账号勾选列表。选择账号并点击“提交选中账号”，即可把规范化后的 CPA auth 上传到配置的远端 CPA 号池。已经成功上传的账号会记录上传时间，失败账号会保留错误状态，可重新选择重试。
+
 ## 2. 支持的 CPA 格式
 
 CPA auth 的 token 和账号信息位于顶层：
@@ -137,16 +139,42 @@ account_pool_monitor/monitor_data/import_batches/<批次>/
   "quota_low_threshold_percent": 5,
   "quota_query_concurrency": 32,
   "import_upload_concurrency": 32,
+  "import_max_bytes": 536870912,
   "proxy_url": "",
   "proxy_check_enabled": true,
   "proxy_check_url": "https://chatgpt.com/cdn-cgi/trace",
   "proxy_check_timeout_seconds": 8,
   "import_keep_alive_in_auth_dir": true,
-  "import_move_dead_from_auth_dir": true
+  "import_move_dead_from_auth_dir": true,
+  "cleanup_quarantine_dir": "",
+  "remote_pool_base_url": "https://YOUR_REMOTE_CPA_HOST",
+  "remote_pool_management_key": "",
+  "remote_pool_upload_concurrency": 16,
+  "remote_pool_timeout_seconds": 25
 }
 ```
 
 如果设置了 `proxy_url`，程序会先使用该代理访问 `proxy_check_url`。预检失败时不会继续验活。
+
+### 远端号池配置
+
+- `remote_pool_base_url`：远端 CPA 根地址，不包含 `/v0/management/auth-files`。
+- `remote_pool_management_key`：远端 CPA 管理密钥。
+- `remote_pool_upload_concurrency`：提交远端号池的并发数，范围 1～64。
+- `remote_pool_timeout_seconds`：每个远端上传请求的超时时间。
+
+管理密钥也可使用环境变量，避免写入配置文件：
+
+```powershell
+$env:CPA_REMOTE_POOL_BASE_URL="https://YOUR_REMOTE_CPA_HOST"
+$env:CPA_REMOTE_POOL_MANAGEMENT_KEY="your-remote-management-key"
+```
+
+远端上传只允许选择最近一次批次中 `alive: true` 的文件，服务端还会再次校验批次、文件名、归档路径、`type: "codex"` 和 `access_token`，不会接受 `dead` 文件或目录穿越路径。
+
+### 清理隔离目录
+
+设置 `cleanup_quarantine_dir` 后，自动清理会按原因把失效 JSON 移入隔离目录，而不是永久删除。留空则保持直接删除行为。建议生产环境配置隔离目录，以便误判时恢复。
 
 ## 8. 自动化测试
 

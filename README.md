@@ -89,6 +89,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start_all.ps1
 
 完整格式示例、验活判定和归档说明见：[CPA / Sub2 JSON 导入验活说明](docs/CPA_SUB2_VALIDATION.md)。
 
+本轮全项目功能审计和已修复问题见：[项目功能审计与优化记录](docs/PROJECT_FUNCTION_AUDIT.md)。
+
 系统也能识别对象数组、`auths` / `data` / `items` 等容器字段和 NDJSON。Sub2 账号会先规范化为 CPA auth，再逐账号导入 CPA，通过真实 WHAM 额度接口验活。结果输出到：
 
 - `account_pool_monitor/monitor_data/import_batches/<批次>/alive`
@@ -98,12 +100,32 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start_all.ps1
 
 K12、带 `session_token` 的 CPA session auth，以及 Sub2 auth 都允许 `refresh_token` 为空；只要 `access_token` 有效且额度接口可正常验证，就不会因缺少 RT 被误判为死亡账号。
 
+验活完成后，页面会列出本批次全部存活账号。可勾选部分或全部账号，点击“提交选中账号”上传到另一个远端 CPA 号池。先在 `account_pool_monitor/monitor_config.json` 配置：
+
+```json
+{
+  "remote_pool_base_url": "https://YOUR_REMOTE_CPA_HOST",
+  "remote_pool_management_key": "",
+  "remote_pool_upload_concurrency": 16,
+  "remote_pool_timeout_seconds": 25
+}
+```
+
+推荐通过环境变量保存远端管理密钥：
+
+```powershell
+$env:CPA_REMOTE_POOL_MANAGEMENT_KEY="your-remote-management-key"
+```
+
+自动清理如需保留被清理的原始 JSON，可配置 `cleanup_quarantine_dir`；为空时才会直接删除。
+
 默认检测并发为 32，可在 `account_pool_monitor/monitor_config.json` 调整：
 
 ```json
 {
   "quota_query_concurrency": 32,
   "import_upload_concurrency": 32,
+  "import_max_bytes": 536870912,
   "proxy_check_enabled": true,
   "proxy_check_url": "https://chatgpt.com/cdn-cgi/trace",
   "proxy_check_timeout_seconds": 8
