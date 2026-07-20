@@ -76,16 +76,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start_all.ps1
 - 总消耗监控：`http://127.0.0.1:18319/`
 - 号池监控：`http://127.0.0.1:18320/`
 
-## 大 JSON 导入检测
+## CPA / Sub2 JSON 导入验活
 
-打开 `http://127.0.0.1:18320/`，在“大 JSON 一键导入检测”区域选择 `.json` / `.jsonl` 文件，点击“选择文件并开始检测”。
+打开 `http://127.0.0.1:18320/`，在“CPA / Sub2 JSON 一键验活”区域选择 `.json` / `.jsonl` 文件，点击“选择文件并开始检测”。
 
-系统会自动识别单个 auth 对象、对象数组、`accounts` / `auths` / `data` / `items` 等容器字段或 NDJSON，拆成单账号小 JSON，上传到 CPA 后检测存活。结果输出到：
+支持以下两类格式：
+
+- **CPA auth JSON**：`type: "codex"`，token 和 `account_id` / `chatgpt_account_id` 位于顶层。
+- **sub2api JSON**：`exported_at` / `proxies` / `accounts` 容器，token、账号 ID、邮箱、套餐和过期时间位于每个账号的 `credentials` 中。
+
+格式字段兼容参考 [GPTSession2CPAandSub2API](https://github.com/yynxxxxx/GPTSession2CPAandSub2API)。
+
+完整格式示例、验活判定和归档说明见：[CPA / Sub2 JSON 导入验活说明](docs/CPA_SUB2_VALIDATION.md)。
+
+系统也能识别对象数组、`auths` / `data` / `items` 等容器字段和 NDJSON。Sub2 账号会先规范化为 CPA auth，再逐账号导入 CPA，通过真实 WHAM 额度接口验活。结果输出到：
 
 - `account_pool_monitor/monitor_data/import_batches/<批次>/alive`
 - `account_pool_monitor/monitor_data/import_batches/<批次>/dead`
 
 默认存活账号保留在 CPA 号池，死亡账号会从号池移除并归档到 `dead`。
+
+K12、带 `session_token` 的 CPA session auth，以及 Sub2 auth 都允许 `refresh_token` 为空；只要 `access_token` 有效且额度接口可正常验证，就不会因缺少 RT 被误判为死亡账号。
 
 默认检测并发为 32，可在 `account_pool_monitor/monitor_config.json` 调整：
 

@@ -74,8 +74,13 @@ WHAM_HEADERS = {
 }
 SENSITIVE_KEYS = {
     "access_token",
+    "accesstoken",
     "refresh_token",
+    "refreshtoken",
     "id_token",
+    "idtoken",
+    "session_token",
+    "sessiontoken",
     "authorization_code",
     "rt",
     "secret",
@@ -357,6 +362,12 @@ PLAN_ALIASES = {
     "free": "free",
 }
 
+# K12 auth files are issued without a refresh token. Session-derived CPA files
+# and sub2api exports can also be access-token-only. They are still directly
+# usable for the WHAM usage probe, so those known formats must not be rejected
+# before the real vitality request is made.
+REFRESH_TOKEN_OPTIONAL_PLANS = {"k12"}
+
 
 def normalize_plan(value: Any) -> str:
     raw = clean_string(value).strip().lower()
@@ -378,6 +389,19 @@ def normalize_plan(value: Any) -> str:
         if re.search(rf"(^|[^a-z0-9]){re.escape(marker)}([^a-z0-9]|$)", raw):
             return plan
     return raw
+
+
+def plan_requires_refresh_token(plan: Any, raw: dict[str, Any] | None = None) -> bool:
+    if normalize_plan(plan) in REFRESH_TOKEN_OPTIONAL_PLANS:
+        return False
+    if not isinstance(raw, dict):
+        return True
+    source_format = clean_string(raw.get("source_format")).lower()
+    if source_format in {"sub2", "sub2api"}:
+        return False
+    if boolish(raw.get("refresh_token_optional")) or boolish(raw.get("id_token_synthetic")):
+        return False
+    return not bool(first_non_empty(raw.get("session_token"), raw.get("sessionToken")))
 
 
 def plan_from_text(value: Any) -> str:
@@ -494,6 +518,7 @@ def scan_auth_accounts(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
         plan, plan_source = extract_plan_from_mapping(raw, file_path.name, raw.get("email"), raw.get("name"))
         if plan == "unknown" and isinstance(access_payload, dict):
             plan, plan_source = extract_plan_from_mapping(access_payload, file_path.name, raw.get("email"), raw.get("name"))
+        refresh_required = plan_requires_refresh_token(plan, raw)
 
         issues: list[str] = []
         if disabled:
@@ -502,7 +527,7 @@ def scan_auth_accounts(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
             issues.append("expired")
         if not has_access:
             issues.append("missing_access")
-        if not has_refresh:
+        if refresh_required and not has_refresh:
             issues.append("missing_refresh")
         if access_expired:
             issues.append("access_expired")
@@ -511,7 +536,7 @@ def scan_auth_accounts(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
             status = "disabled"
         elif expired:
             status = "expired"
-        elif not has_access or not has_refresh:
+        elif not has_access or (refresh_required and not has_refresh):
             status = "missing_token"
         elif access_expired:
             status = "token_expired"
@@ -537,6 +562,7 @@ def scan_auth_accounts(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
                 "access_seconds_left": seconds_left(access_exp_at),
                 "has_access": has_access,
                 "has_refresh": has_refresh,
+                "refresh_required": refresh_required,
                 "account_id_tail": mask_tail(account_id),
                 "account_id_hash": short_hash(account_id),
                 "_account_id": account_id,
@@ -1712,9 +1738,14 @@ def export_available_accounts(cfg: dict[str, Any], refresh_quota: bool = True) -
 
 
 AUTH_RECORD_MARKERS = {
+    "accessToken",
     "access_token",
+    "refreshToken",
     "refresh_token",
+    "idToken",
     "id_token",
+    "sessionToken",
+    "session_token",
     "chatgpt_account_id",
     "chatgptAccountId",
     "account_id",
@@ -1750,7 +1781,62 @@ def read_last_import_result() -> dict[str, Any] | None:
 def looks_like_auth_record(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
+    credentials = value.get("credentials")
+    if isinstance(credentials, dict) and first_non_empty(
+        credentials.get("access_token"),
+        credentials.get("accessToken"),
+    ):
+        return True
     return any(key in value and value.get(key) not in (None, "") for key in AUTH_RECORD_MARKERS)
+
+
+def detect_import_account_format(raw: dict[str, Any]) -> str:
+    credentials = raw.get("credentials")
+    declared_type = clean_string(first_non_empty(raw.get("type"), raw.get("provider"), raw.get("platform"))).lower()
+    has_chatgpt_identity = bool(
+        first_non_empty(
+            raw.get("chatgpt_account_id"),
+            raw.get("chatgptAccountId"),
+        )
+    )
+    if isinstance(credentials, dict):
+        nested_access = first_non_empty(credentials.get("access_token"), credentials.get("accessToken"))
+        platform = clean_string(raw.get("platform")).lower()
+        auth_type = clean_string(raw.get("type")).lower()
+        nested_account_id = first_non_empty(
+            credentials.get("chatgpt_account_id"),
+            credentials.get("chatgptAccountId"),
+            credentials.get("account_id"),
+            credentials.get("accountID"),
+        )
+        if platform in {"openai", "codex"} and (nested_access or auth_type in {"oauth", "token"}):
+            return "sub2api"
+        if nested_access and nested_account_id and auth_type in {"oauth", "token"}:
+            return "sub2api"
+    snake_token = first_non_empty(raw.get("access_token"), raw.get("refresh_token"), raw.get("id_token"))
+    if snake_token and (declared_type in {"", "codex", "openai"} or has_chatgpt_identity):
+        return "cpa"
+    if clean_string(raw.get("type")).lower() == "codex":
+        return "cpa"
+    camel_token = first_non_empty(raw.get("accessToken"), raw.get("refreshToken"), raw.get("idToken"))
+    if camel_token and (declared_type in {"codex", "openai"} or has_chatgpt_identity):
+        return "camel_oauth"
+    if snake_token or camel_token:
+        return "other_auth"
+    return "unknown"
+
+
+def nested_mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def jwt_openai_sections(token: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    payload = decode_jwt_payload(token)
+    if not isinstance(payload, dict):
+        return {}, {}, {}
+    auth = nested_mapping(payload.get("https://api.openai.com/auth"))
+    profile = nested_mapping(payload.get("https://api.openai.com/profile"))
+    return payload, auth, profile
 
 
 def parse_json_bytes(raw: bytes) -> Any:
@@ -1782,12 +1868,13 @@ def parse_ndjson_bytes(raw: bytes) -> list[tuple[dict[str, Any], str]]:
         except Exception as exc:
             errors.append(f"line {lineno}: {exc}")
             continue
-        if isinstance(parsed, dict):
-            items.append((parsed, f"line-{lineno}"))
-        elif isinstance(parsed, list):
-            for index, item in enumerate(parsed, 1):
-                if isinstance(item, dict):
-                    items.append((item, f"line-{lineno}-{index}"))
+        try:
+            nested_items = collect_import_accounts(parsed)
+        except ValueError as exc:
+            errors.append(f"line {lineno}: {exc}")
+            continue
+        for item, source_key in nested_items:
+            items.append((item, f"line-{lineno}-{source_key}"))
     if not items:
         detail = "; ".join(errors[:3])
         raise ValueError("无法识别 JSON/NDJSON 账号数据" + (": " + detail if detail else ""))
@@ -1818,7 +1905,7 @@ def collect_import_accounts(payload: Any) -> list[tuple[dict[str, Any], str]]:
             return auth_like
         if len(mapped) > 1:
             return mapped
-    raise ValueError("无法识别账号列表：支持单个 auth 对象、对象数组、accounts/auths/data/items 等字段、或 NDJSON")
+    raise ValueError("无法识别账号列表：支持 CPA auth、Sub2 exported_at/proxies/accounts、对象数组、accounts/auths/data/items 字段或 NDJSON")
 
 
 def parse_import_accounts(raw: bytes) -> list[tuple[dict[str, Any], str]]:
@@ -1830,12 +1917,126 @@ def parse_import_accounts(raw: bytes) -> list[tuple[dict[str, Any], str]]:
 
 
 def normalize_import_account(raw: dict[str, Any]) -> dict[str, Any]:
+    source_format = detect_import_account_format(raw)
+    credentials = nested_mapping(raw.get("credentials"))
+    extra = nested_mapping(raw.get("extra"))
+    token = nested_mapping(raw.get("token"))
+
+    access_token = first_non_empty(
+        raw.get("access_token"),
+        raw.get("accessToken"),
+        credentials.get("access_token"),
+        credentials.get("accessToken"),
+        token.get("access_token"),
+        token.get("accessToken"),
+    )
+    refresh_token = first_non_empty(
+        raw.get("refresh_token"),
+        raw.get("refreshToken"),
+        credentials.get("refresh_token"),
+        credentials.get("refreshToken"),
+        token.get("refresh_token"),
+        token.get("refreshToken"),
+    )
+    id_token = first_non_empty(
+        raw.get("id_token"),
+        raw.get("idToken"),
+        credentials.get("id_token"),
+        credentials.get("idToken"),
+        token.get("id_token"),
+        token.get("idToken"),
+    )
+    session_token = first_non_empty(
+        raw.get("session_token"),
+        raw.get("sessionToken"),
+        credentials.get("session_token"),
+        credentials.get("sessionToken"),
+        token.get("session_token"),
+        token.get("sessionToken"),
+    )
+    access_payload, access_auth, access_profile = jwt_openai_sections(access_token)
+    id_payload, id_auth, id_profile = jwt_openai_sections(id_token)
+    account_id = first_non_empty(
+        raw.get("chatgpt_account_id"),
+        raw.get("chatgptAccountId"),
+        raw.get("account_id"),
+        raw.get("accountID"),
+        credentials.get("chatgpt_account_id"),
+        credentials.get("chatgptAccountId"),
+        credentials.get("account_id"),
+        credentials.get("accountID"),
+        access_auth.get("chatgpt_account_id"),
+        access_auth.get("account_id"),
+        id_auth.get("chatgpt_account_id"),
+        id_auth.get("account_id"),
+    )
+    email = first_non_empty(
+        raw.get("email"),
+        credentials.get("email"),
+        extra.get("email"),
+        access_profile.get("email"),
+        id_profile.get("email"),
+        access_payload.get("email"),
+        id_payload.get("email"),
+    )
+    plan = first_non_empty(
+        raw.get("plan_type"),
+        raw.get("chatgpt_plan_type"),
+        raw.get("planType"),
+        credentials.get("plan_type"),
+        credentials.get("chatgpt_plan_type"),
+        credentials.get("planType"),
+        access_auth.get("chatgpt_plan_type"),
+        id_auth.get("chatgpt_plan_type"),
+    )
+    expired = first_value(raw, "expired", "expires_at", "expiresAt")
+    if expired in (None, ""):
+        expired = first_value(credentials, "expired", "expires_at", "expiresAt")
+    if expired in (None, "") and access_payload.get("exp") not in (None, ""):
+        expired = access_payload.get("exp")
+
+    if source_format == "sub2api":
+        account = {
+            "type": "codex",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "session_token": session_token,
+            "account_id": account_id,
+            "chatgpt_account_id": account_id,
+            "email": email,
+            "name": first_non_empty(raw.get("name"), email),
+            "plan_type": normalize_plan(plan) or plan,
+            "expired": expired,
+            "last_refresh": first_non_empty(raw.get("last_refresh"), extra.get("last_refresh")),
+            "disabled": boolish(raw.get("disabled")) or raw.get("enabled") is False or raw.get("is_active") is False,
+            "source_format": "sub2api",
+            "refresh_token_optional": True,
+        }
+        return {key: value for key, value in account.items() if value not in (None, "") or key == "refresh_token"}
+
     account = dict(raw)
     provider = clean_string(account.get("provider"))
-    if provider and not clean_string(account.get("type")):
-        account["type"] = provider
-    if not clean_string(account.get("type")) and looks_like_auth_record(account):
+    if source_format in {"cpa", "camel_oauth"} or provider.lower() in {"codex", "openai"}:
         account["type"] = "codex"
+    elif provider and not clean_string(account.get("type")):
+        account["type"] = provider
+    elif not clean_string(account.get("type")) and looks_like_auth_record(account):
+        account["type"] = "codex"
+
+    canonical_values = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "session_token": session_token,
+        "account_id": account_id,
+        "email": email,
+        "plan_type": normalize_plan(plan) or plan,
+        "expired": expired,
+    }
+    for key, value in canonical_values.items():
+        if value not in (None, "") and account.get(key) in (None, ""):
+            account[key] = value
     return account
 
 
@@ -1993,6 +2194,7 @@ def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, r
         "upload_concurrency": int(cfg.get("import_upload_concurrency") or 32),
         "quota_concurrency": int(cfg.get("quota_query_concurrency") or 32),
         "detected": len(parsed_accounts),
+        "formats": {},
         "split": 0,
         "uploaded": 0,
         "alive": 0,
@@ -2008,6 +2210,8 @@ def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, r
             if not isinstance(raw_account, dict):
                 result["errors"] += 1
                 continue
+            source_format = detect_import_account_format(raw_account)
+            result["formats"][source_format] = int(result["formats"].get(source_format) or 0) + 1
             account = normalize_import_account(raw_account)
             name = import_account_filename(account, index, source_stem, source_key, used_names)
             split_path = split_dir / name
@@ -2016,6 +2220,7 @@ def import_large_json_batch(cfg: dict[str, Any], source_name: str, raw: bytes, r
                 "file": name,
                 "email": clean_string(account.get("email")),
                 "name": clean_string(account.get("name")),
+                "source_format": source_format,
                 "source_key": source_key,
                 "split_path": str(split_path),
                 "auth_path": str(auth_path),
@@ -2620,8 +2825,8 @@ def render_index() -> str:
     <div class="metrics" id="metrics"></div>
     <section class="import-panel">
       <div class="section-head">
-        <h2>大 JSON 一键导入检测</h2>
-        <div class="muted">自动识别数组 / accounts / auths / NDJSON，拆成单账号 JSON 后导入 CPA 并按存活归档</div>
+        <h2>CPA / Sub2 JSON 一键验活</h2>
+        <div class="muted">自动识别 CPA auth、sub2api exported_at/proxies/accounts、数组和 NDJSON；Sub2 会转成 CPA auth 后验活并归档</div>
       </div>
       <div class="import-grid">
         <input id="importFile" type="file" accept=".json,.jsonl,.ndjson,application/json">
@@ -2765,9 +2970,11 @@ def render_index() -> str:
       const download = result.download_url ? ` · <a href="${h(result.download_url)}" target="_blank">下载归档 zip</a>` : '';
       const proxy = result.proxy_check || {};
       const proxyText = proxy.enabled ? `代理预检 HTTP ${h(proxy.status || 'ok')} / ${h(proxy.elapsed_seconds || 0)}s` : `代理预检 ${h(proxy.reason || '跳过')}`;
+      const formats = Object.entries(result.formats || {}).map(([name, count]) => `${h(name)} ${h(count)}`).join(' / ');
       target.innerHTML = [
         `<b>最近导入：</b>${h(result.source_file || result.batch_id || '-')}`,
         `识别 ${h(result.detected ?? 0)} 个，拆分 ${h(result.split ?? 0)} 个，上传 ${h(result.uploaded ?? 0)} 个`,
+        formats ? `格式 ${formats}` : '',
         `并发：上传 ${h(result.upload_concurrency || '-')} / 检测 ${h(result.quota_concurrency || '-')}`,
         proxyText,
         `<span class="pill good">存活 ${h(result.alive ?? 0)}</span>`,
@@ -2775,7 +2982,7 @@ def render_index() -> str:
         `<span class="pill ${result.errors ? 'bad' : 'good'}">错误 ${h(result.errors ?? 0)}</span>`,
         `<br>存活目录：<span class="mono">${h(result.alive_dir || '-')}</span>`,
         `<br>死亡目录：<span class="mono">${h(result.dead_dir || '-')}</span>${download}`
-      ].join(' · ');
+      ].filter(Boolean).join(' · ');
     }
     function render(data) {
       state = data;
